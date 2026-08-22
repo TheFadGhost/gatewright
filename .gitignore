@@ -1,0 +1,43 @@
+# Build artifacts
+/dist/
+/gatewright
+/gatewright.exe
+/gw-store/
+*.exe
+*.test
+*.out
+
+# Real configuration (config.example.* is committed; anything else may hold secrets)
+config.yaml
+config.yml
+configs/*.yaml
+!config.example.yaml
+
+# TLS material — generated at test time, never committed
+*.pem
+*.key
+*.crt
+*.csr
+*.p12
+*.pfx
+certs/
+
+# Environment / secrets
+.env
+.env.*
+*.token
+
+# Coverage and profiling
+coverage.txt
+*.prof
+*.pprof
+
+# Load test results
+/load/results/
+
+# Editor and OS noise
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini
