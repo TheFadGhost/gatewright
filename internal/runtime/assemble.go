@@ -1,8 +1,11 @@
 package runtime
 
 import (
+	"bufio"
 	"context"
+	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"runtime/debug"
@@ -93,11 +96,30 @@ func (cw *countingWriter) Flush() {
 	}
 }
 
-// routeChain lazily assembles (once per generation) each route's middleware
-// stack ending in its forwarder.
+// Hijack passes protocol upgrades (RFC6455 et al) through to the server
+// connection; mirrors middleware's completionWriter. Additive only.
+func (cw *countingWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	hj, ok := cw.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, errors.New("runtime: ResponseWriter does not support Hijack")
+	}
+	return hj.Hijack()
+}
+
+// routeChain assembles each route's middleware stack ending in its forwarder,
+// exactly once per runtime generation. Safe under concurrent first requests.
 func (rt *Runtime) routeChain(logger obs.Logger, metrics *obs.Metrics, route *config.Route) http.Handler {
-	if h, ok := rt.chains[route.Name]; ok {
+	rt.chainMu.RLock()
+	h, ok := rt.chains[route.Name]
+	rt.chainMu.RUnlock()
+	if ok {
 		return h
+	}
+
+	rt.chainMu.Lock()
+	defer rt.chainMu.Unlock()
+	if h, ok := rt.chains[route.Name]; ok {
+		return h // lost the race; another request built it
 	}
 	fwd := rt.routeFwd[route.Name]
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -132,9 +154,9 @@ func (rt *Runtime) routeChain(logger obs.Logger, metrics *obs.Metrics, route *co
 	for i, m := range mws {
 		timed = append(timed, timeStage(stageNames(i, len(mws)), m))
 	}
-	h := middleware.Chain(handler, timed...)
-	rt.chains[route.Name] = h
-	return h
+	chain := middleware.Chain(handler, timed...)
+	rt.chains[route.Name] = chain
+	return chain
 }
 
 // stageNames maps pipeline positions to documented names for trace output.
@@ -181,6 +203,15 @@ func (rw *recoverWriter) Flush() {
 	if f, ok := rw.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
 	}
+}
+
+// Hijack passes protocol upgrades through to the server connection.
+func (rw *recoverWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	hj, ok := rw.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, errors.New("runtime: ResponseWriter does not support Hijack")
+	}
+	return hj.Hijack()
 }
 
 func recoverMiddleware(next http.Handler) http.Handler {

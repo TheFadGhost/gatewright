@@ -1,6 +1,9 @@
 package middleware
 
 import (
+	"bufio"
+	"errors"
+	"net"
 	"net/http"
 	"time"
 
@@ -37,6 +40,16 @@ func (c *captureWriter) status() int {
 		return http.StatusOK // Go's implicit default for handlers that never write
 	}
 	return c.code
+}
+
+// Hijack passes protocol upgrades through to the server connection so the
+// access-log stage stays transparent to RFC6455-style tunneling.
+func (c *captureWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	hj, ok := c.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, errors.New("middleware: ResponseWriter does not support Hijack")
+	}
+	return hj.Hijack()
 }
 
 // NewAccessLog starts the per-request timer, installs (or reuses) the Record

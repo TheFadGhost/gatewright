@@ -50,6 +50,7 @@ type Runtime struct {
 	engines    map[string]limiter.Limiter             // "route/name" -> engine
 	settings   map[string]uint64                      // carry-over identity
 	chains     map[string]http.Handler                // route name -> inner chain
+	chainMu    sync.RWMutex                           // guards chains (lazy build)
 	handler    http.Handler                           // full assembled pipeline
 	cancel     context.CancelFunc
 	wg         sync.WaitGroup

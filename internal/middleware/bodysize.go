@@ -1,9 +1,11 @@
 package middleware
 
 import (
+	"bufio"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"time"
 
@@ -92,6 +94,16 @@ func (l *limitWriter) finish() {
 		l.handled = true
 		l.deny()
 	}
+}
+
+// Hijack passes protocol upgrades through; a hijacked connection carries no
+// further body traffic, so the limit accounting simply ends with the stage.
+func (l *limitWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	hj, ok := l.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, errors.New("middleware: ResponseWriter does not support Hijack")
+	}
+	return hj.Hijack()
 }
 
 // NewBodyLimit enforces the route body limit: -1 means unlimited. Oversize

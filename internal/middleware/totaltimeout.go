@@ -1,8 +1,10 @@
 package middleware
 
 import (
+	"bufio"
 	"context"
 	"errors"
+	"net"
 	"net/http"
 	"sync"
 	"time"
@@ -67,6 +69,17 @@ func (t *timeoutWriter) Write(b []byte) (int, error) {
 		t.ResponseWriter.WriteHeader(http.StatusOK)
 	}
 	return t.ResponseWriter.Write(b)
+}
+
+// Hijack passes protocol upgrades through to the server connection. Once the
+// connection is hijacked the deadline watcher can no longer write an envelope,
+// which markFinished/expire already tolerate.
+func (t *timeoutWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	hj, ok := t.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, errors.New("middleware: ResponseWriter does not support Hijack")
+	}
+	return hj.Hijack()
 }
 
 // NewTotalTimeout bounds the whole request lifetime with a context deadline.
