@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Gatewright admin</title>
+<link rel="stylesheet" href="assets/styles.css">
+<script>
+document.documentElement.dataset.theme = (function () {
+  try {
+    var t = localStorage.getItem("gatewright.admin.theme");
+    return (t === "light" || t === "contrast") ? t : "dark";
+  } catch (e) { return "dark"; }
+})();
+</script>
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-name">GATEWRIGHT</span>
+    <span id="hdr-version" class="num dim"></span>
+  </div>
+  <div class="meta">
+    <span class="lbl">uptime</span>
+    <span id="hdr-uptime" class="num">-</span>
+  </div>
+  <div class="spacer"></div>
+  <button id="btn-reload" type="button">reload config</button>
+  <span id="reload-status" class="reload-status" role="status"></span>
+  <button id="btn-theme" type="button">theme: dark</button>
+  <button id="btn-help" type="button" aria-label="keyboard shortcuts" title="keyboard shortcuts">?</button>
+</header>
+
+<div id="sr-status" class="sr-only" aria-live="polite"></div>
+
+<section id="error-panel" class="error-panel" hidden>
+  <p id="error-message"></p>
+  <button id="btn-retry" type="button">Retry</button>
+</section>
+
+<main id="main">
+  <section id="routes-section" aria-busy="true">
+    <div class="section-head">
+      <h2>ROUTES</h2>
+      <input id="filter-input" type="text" placeholder="filter routes (/)"
+             aria-label="filter routes" autocomplete="off" spellcheck="false">
+    </div>
+    <table class="grid" id="routes-table">
+      <colgroup>
+        <col style="width:14%"><col style="width:26%"><col style="width:16%">
+        <col style="width:7ch"><col style="width:7ch"><col style="width:9ch">
+        <col style="width:20%">
+      </colgroup>
+      <thead>
+        <tr><th>NAME</th><th>MATCH</th><th>UPSTREAM</th><th class="num-h">RPS</th><th class="num-h">P95</th><th class="num-h">STATUS</th><th>LIMITER</th></tr>
+      </thead>
+      <tbody id="routes-body"></tbody>
+    </table>
+  </section>
+
+  <section id="upstreams-section" aria-busy="true">
+    <div class="section-head"><h2>UPSTREAMS</h2></div>
+    <table class="grid" id="upstreams-table">
+      <colgroup>
+        <col style="width:30%"><col style="width:10%"><col style="width:8ch">
+        <col style="width:10ch"><col style="width:10ch"><col style="width:16%">
+      </colgroup>
+      <thead>
+        <tr><th>TARGET</th><th>CIRCUIT</th><th class="num-h">INFLIGHT</th><th class="num-h">REQ TOTAL</th><th class="num-h">FAIL TOTAL</th><th>EJECTED UNTIL</th></tr>
+      </thead>
+      <tbody id="upstreams-body"></tbody>
+    </table>
+  </section>
+
+  <section id="limiters-section" aria-busy="true">
+    <div class="section-head"><h2>LIMITERS</h2></div>
+    <table class="grid" id="limiters-table">
+      <colgroup>
+        <col style="width:12%"><col style="width:14%"><col style="width:16%">
+        <col style="width:12%"><col style="width:9ch"><col style="width:9ch">
+        <col style="width:18%"><col style="width:8ch"><col style="width:9ch">
+      </colgroup>
+      <thead>
+        <tr><th>ROUTE</th><th>NAME</th><th>STRATEGY</th><th>KEY</th><th class="num-h">ALLOWED/S</th><th class="num-h">LIMITED/S</th><th>ACTIVITY</th><th class="num-h">USAGE</th><th class="num-h">EVICTIONS</th></tr>
+      </thead>
+      <tbody id="limiters-body"></tbody>
+    </table>
+  </section>
+
+  <section id="chart-section">
+    <div class="section-head">
+      <h2 id="chart-title">LATENCY</h2>
+      <div class="legend">
+        <span class="legend-item"><span class="swatch swatch-p50"></span>p50</span>
+        <span class="legend-item"><span class="swatch swatch-p95"></span>p95</span>
+        <span class="legend-item"><span class="swatch swatch-p99"></span>p99</span>
+      </div>
+    </div>
+    <canvas id="latency-canvas" height="220" aria-label="latency percentiles chart, milliseconds over the last minute of samples"></canvas>
+    <p id="chart-empty" class="empty" hidden>No latency data yet.</p>
+  </section>
+</main>
+
+<aside id="detail" hidden role="dialog" aria-labelledby="detail-title" tabindex="-1">
+  <header class="detail-head">
+    <h2 id="detail-title"></h2>
+    <button id="detail-close" type="button">close</button>
+  </header>
+  <dl id="detail-body"></dl>
+</aside>
+
+<div id="overlay" hidden>
+  <div id="overlay-box" role="dialog" aria-modal="true" aria-labelledby="overlay-title">
+    <h2 id="overlay-title">Keyboard shortcuts</h2>
+    <table class="keys">
+      <tbody>
+        <tr><th>j / k</th><td>move route selection down / up</td></tr>
+        <tr><th>Enter</th><td>open route detail panel</td></tr>
+        <tr><th>Esc</th><td>close panel or dialog</td></tr>
+        <tr><th>/</th><td>focus route filter</td></tr>
+        <tr><th>?</th><td>toggle this help</td></tr>
+      </tbody>
+    </table>
+    <button id="overlay-close" type="button">close</button>
+  </div>
+</div>
+
+<script src="assets/app.js"></script>
+</body>
+</html>

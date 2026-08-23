@@ -33,8 +33,10 @@ func TraceFrom(ctx context.Context) *Trace {
 	return t
 }
 
-// Record appends a stage duration. Safe to call with tracing disabled (no-op).
-func Record(ctx context.Context, name string, d time.Duration) {
+// RecordStage appends a stage duration. Safe to call with tracing disabled
+// (no-op). Renamed from Record so that record.go's required accumulator type
+// Record can own the short name.
+func RecordStage(ctx context.Context, name string, d time.Duration) {
 	if t := TraceFrom(ctx); t != nil {
 		t.Stages = append(t.Stages, StageTiming{Name: name, Duration: d})
 	}
