@@ -24,12 +24,18 @@ type routeStats struct {
 
 type liveCounters struct {
 	requests uint64
+	status2xx uint64
+	status4xx uint64
+	status5xx uint64
 	buckets  [lenLatBuckets]uint64
 }
 
 type sample struct {
 	seq      uint64
 	requests uint64
+	status2xx uint64
+	status4xx uint64
+	status5xx uint64
 	buckets  [lenLatBuckets]uint64
 }
 
@@ -67,6 +73,14 @@ func (rs *routeStats) countRequest(route string, start time.Time, status int) {
 	b := bucketFor(ms)
 	rs.mu.Lock()
 	lc.buckets[b]++
+	switch {
+	case status >= 500:
+		lc.status5xx++
+	case status >= 400:
+		lc.status4xx++
+	default:
+		lc.status2xx++
+	}
 	lc.requests++
 	rs.mu.Unlock()
 }
@@ -77,7 +91,11 @@ func (rs *routeStats) tick() {
 	defer rs.mu.Unlock()
 	rs.seq++
 	for route, lc := range rs.cur {
-		s := sample{seq: rs.seq, requests: lc.requests, buckets: lc.buckets}
+		s := sample{
+			seq: rs.seq, requests: lc.requests,
+			status2xx: lc.status2xx, status4xx: lc.status4xx, status5xx: lc.status5xx,
+			buckets: lc.buckets,
+		}
 		ring := rs.samples[route]
 		ring = append(ring, s)
 		if len(ring) > 60 {
@@ -85,6 +103,22 @@ func (rs *routeStats) tick() {
 		}
 		rs.samples[route] = ring
 	}
+}
+
+// statusCounts returns 2xx/4xx/5xx deltas over the last minute.
+func (rs *routeStats) statusCounts(route string) ([3]uint64, bool) {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	var out [3]uint64
+	ring := rs.samples[route]
+	if len(ring) < 2 {
+		return out, false
+	}
+	newest, oldest := ring[len(ring)-1], ring[0]
+	out[0] = newest.status2xx - oldest.status2xx
+	out[1] = newest.status4xx - oldest.status4xx
+	out[2] = newest.status5xx - oldest.status5xx
+	return out, true
 }
 
 func (rs *routeStats) ratePerSec(route string, window time.Duration) (float64, bool) {
@@ -260,6 +294,27 @@ func (s *Supervisor) RequestRates() map[string]float64 {
 	for _, name := range routes {
 		if v, ok := rt.stats.ratePerSec(name, time.Minute); ok {
 			out[name] = v
+		}
+	}
+	return out
+}
+
+// StatusCounts implements admin.SnapshotProvider.
+func (s *Supervisor) StatusCounts() map[string][3]uint64 {
+	rt := s.current.Load()
+	if rt == nil {
+		return nil
+	}
+	rt.stats.mu.Lock()
+	routes := make([]string, 0, len(rt.stats.cur))
+	for name := range rt.stats.cur {
+		routes = append(routes, name)
+	}
+	rt.stats.mu.Unlock()
+	out := make(map[string][3]uint64, len(routes))
+	for _, name := range routes {
+		if counts, ok := rt.stats.statusCounts(name); ok {
+			out[name] = counts
 		}
 	}
 	return out

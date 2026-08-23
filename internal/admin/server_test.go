@@ -82,6 +82,10 @@ func (f *fakeProvider) LatencyPercentiles(route string, window time.Duration) (f
 
 func (f *fakeProvider) RequestRates() map[string]float64 { return f.rates }
 
+func (f *fakeProvider) StatusCounts() map[string][3]uint64 {
+	return map[string][3]uint64{"api-v1": {120, 2, 0}}
+}
+
 func (f *fakeProvider) LimiterViews() []LimiterView { return f.limiters }
 
 func (f *fakeProvider) Reload() error {

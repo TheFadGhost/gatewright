@@ -123,6 +123,9 @@ func (s *Server) buildState() StateDTO {
 	for _, rv := range routes {
 		row := RouteStateDTO{RouteView: rv}
 		row.RPS = rates[rv.Name]
+		if sc, ok := s.sp.StatusCounts()[rv.Name]; ok {
+			row.Status2xx, row.Status4xx, row.Status5xx = sc[0], sc[1], sc[2]
+		}
 		p50, p95, p99, ok := s.sp.LatencyPercentiles(rv.Name, percentileWindow)
 		row.Percentiles = PercentileDTO{OK: ok}
 		if ok {

@@ -25,6 +25,8 @@ type SnapshotProvider interface {
 	LatencyPercentiles(route string, window time.Duration) (p50, p95, p99 float64, ok bool)
 	// RequestRates reports requests per second per route over the last minute.
 	RequestRates() map[string]float64
+	// StatusCounts reports 2xx/4xx/5xx counts per route over the last minute.
+	StatusCounts() map[string][3]uint64
 	// LimiterViews snapshots limiter activity.
 	LimiterViews() []LimiterView
 	// Reload triggers a hot reload of configuration.
@@ -77,6 +79,10 @@ type RouteStateDTO struct {
 	RouteView
 	RPS         float64       `json:"rps"`
 	Percentiles PercentileDTO `json:"percentiles"`
+	// StatusCounts is 2xx/4xx/5xx request counts over the last minute.
+	Status2xx uint64 `json:"status_2xx"`
+	Status4xx uint64 `json:"status_4xx"`
+	Status5xx uint64 `json:"status_5xx"`
 }
 
 // TargetDTO is the wire shape of pool.TargetStatus with stable lowercase keys

@@ -17,19 +17,23 @@ func validateCmd(args []string) {
 	fs := flagSet("validate")
 	cfgPath := fs.String("c", "gateway.yaml", "configuration file")
 	diffPath := fs.String("diff", "", "compare against this older config and print the change set")
-	noColor := fs.Bool("no-color", false, "disable coloured terminal output")
 	fs.Parse(args)
-	_ = noColor // reserved: validate output is plain text today
 
 	if *diffPath != "" {
 		runDiff(*cfgPath, *diffPath)
 	}
 
-	if _, verr := configLoad(*cfgPath); verr != nil {
+	if cfg, verr := configLoad(*cfgPath); verr != nil {
 		fmt.Fprint(os.Stderr, verr.Error())
 		os.Exit(1)
+	} else {
+		limiters := 0
+		for i := range cfg.Routes {
+			limiters += len(cfg.Routes[i].RateLimits)
+		}
+		fmt.Printf("%s: OK (%d routes, %d pools, %d limiters)\n",
+			*cfgPath, len(cfg.Routes), len(cfg.Upstreams), limiters)
 	}
-	fmt.Printf("%s: OK\n", *cfgPath)
 }
 
 func runDiff(newPath, oldPath string) {

@@ -457,8 +457,15 @@ func (v *ValidationError) Error() string {
 		b.WriteString("  ")
 		b.WriteString(e.Error())
 		b.WriteString("\n")
+		if e.Line > 0 {
+			col := e.Column
+			if col == 0 {
+				col = 1
+			}
+			fmt.Fprintf(&b, "    --> %s:%d:%d\n", e.File, e.Line, col)
+		}
 		if e.Hint != "" {
-			fmt.Fprintf(&b, "  hint: %s\n", e.Hint)
+			fmt.Fprintf(&b, "    hint: %s\n", e.Hint)
 		}
 	}
 	return b.String()

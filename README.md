@@ -142,7 +142,7 @@ Omit the whole block for plain HTTP.
 | --- | --- | --- | --- |
 | `cert_file` | file path | (empty) | TLS certificate chain; required with `key_file` when TLS is used. |
 | `key_file` | file path | (empty) | TLS private key. |
-| `min_version` | enum: `tls10`, `tls11`, `tls12`, `tls13` | `tls12` | `tls10`/`tls11` produce loud deprecation warnings at startup. |
+| `min_version` | enum: `tls12`, `tls13` | `tls12` | TLS 1.0/1.1 are rejected by validation; the gateway refuses to ship them. |
 
 ### `admin`
 

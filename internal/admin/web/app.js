@@ -256,7 +256,8 @@ function renderRoutes() {
       tr.cells[4].textContent = r.percentiles && r.percentiles.ok && r.percentiles.p95_ms != null
         ? fmtMs(r.percentiles.p95_ms)
         : "-";
-      tr.cells[5].textContent = "-/-/-";
+      tr.cells[5].textContent =
+        `${r.status_2xx ?? "-"}/${r.status_4xx ?? "-"}/${r.status_5xx ?? "-"}`;
       tr.cells[6].textContent = "";
       if (r.has_limiter) {
         tr.cells[6].appendChild(el("span", null, r.limiter_name || "(limiter)"));

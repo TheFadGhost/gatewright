@@ -189,14 +189,12 @@ func serverTLSConfig(st *config.ServerTLS, logger obs.Logger) (*tls.Config, erro
 	}
 	min := uint16(tls.VersionTLS12)
 	switch st.MinVersion {
-	case "tls10":
-		min = tls.VersionTLS10
-		logger.Warn("TLS 1.0 enabled; deprecated and insecure", "min_version", "tls10")
-	case "tls11":
-		min = tls.VersionTLS11
-		logger.Warn("TLS 1.1 enabled; deprecated and insecure", "min_version", "tls11")
 	case "tls13":
 		min = tls.VersionTLS13
+	default:
+		// Config validation restricts min_version to tls12|tls13; anything
+		// else never reaches the running gateway.
+		min = tls.VersionTLS12
 	}
 	return &tls.Config{
 		Certificates: []tls.Certificate{cert},

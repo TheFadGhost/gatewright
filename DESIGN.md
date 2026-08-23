@@ -244,11 +244,14 @@ reporting; each decision is logged individually.
 
 YAML. Read by whoever is paged, edited under pressure, so:
 
-- **snake_case keys**, always; enums are bare words (`round_robin`, not `"ROUND_ROBIN"`).
-- **Nesting depth ≤ 3** (e.g. `routes[].rate_limits[].window` is the floor).
-- **Units are always explicit**: durations are strings with unit suffix (`30s`, `100ms`);
-  sizes use IEC suffixes (`16KiB`, `2MiB`). A bare number where a duration/size is
-  expected is a validation **error**, not an implicit seconds assumption.
+- snake_case keys, always; enums are bare words (`round_robin`, not `"ROUND_ROBIN"`).
+- Nesting depth ≤ 3 for route-level knobs (e.g. `routes[].rate_limits[].window`).
+  Upstream operational blocks (`health_check.active.*`, `circuit_breaker.*`) may
+  reach depth 4–5: they are edited rarely and grouping beats flatness there.
+- Units are always explicit: durations are strings with unit suffix (`30s`, `100ms`);
+  sizes use IEC suffixes (`16KiB`, `2MiB`; decimal `KB`/`MB`/`GB` accepted as
+  explicit aliases). A bare number where a duration/size is expected is a validation
+  **error**, not an implicit seconds assumption.
 - **Enums, not magic strings**: strategies, formats, load balancers, hash keys, TLS
   versions, auth types are enumerated and validated with named alternatives in errors.
 - **Every default is stated** in README's config reference; unspecified ≠ undefined.
@@ -404,11 +407,20 @@ JSON mode (one object per line):
 {"ts":"2026-08-22T09:14:07.412Z","level":"info","msg":"access","req_id":"gw-01J9ZK...","method":"GET","path":"/v1/users/42","query":"","route":"api-v1","upstream":"catalog","upstream_addr":"127.0.0.1:9001","status":200,"bytes_in":0,"bytes_out":1523,"duration_ms":12.31,"remote":"203.0.113.9:52344","code":"","limiter_name":"ip-burst","limiter_outcome":"allowed"}
 ```
 
-Human mode (single line, aligned, colour only when TTY):
+Human mode (single line; `key=value` pairs sorted alphabetically after the core
+`req_id status duration_ms` group, full field names, colour only when TTY):
 
 ```
-2026-08-22T09:14:07Z INF req_id=gw-01J9ZK GET /v1/users/42 route=api-v1 upstream=catalog status=200 dur=12.3ms out=1523B remote=203.0.113.9
+2026-08-22T09:14:07Z INF req_id=gw-01J9ZK GET /v1/users/42 route=api-v1 upstream=catalog status=200 duration_ms=12.3 bytes_out=1523 remote=203.0.113.9:52344 method=GET path=/v1/users/42
 ```
+
+JSON mode omits string fields whose value is the empty string (e.g. `query`, `code`
+on success); numeric fields are always emitted. Both behaviours are part of this
+contract.
+
+When request tracing is enabled and requested per request, an additional structured
+event is emitted — `msg="request-trace"` with `req_id`, `route`, `status`, `stages` —
+see §6.
 
 Configurable subset via `observability.access_log.fields`; defaults emit all core fields.
 
@@ -511,10 +523,12 @@ Ejected targets append `(ejected 12s ago)`. Never a dot without its word.
 
 ### Latency chart treatment
 
-- Rolling 5-minute window, 10 s buckets.
-- Three series: **p50**, **p95**, **p99** — percentiles named in legend, never averages.
+- Rolling 60-second window at one-second resolution (matches the SSE update cadence).
+- Each plotted point is the p50/p95/p99 computed over a trailing five-minute
+  percentile window — named percentiles, never averages.
 - Y-axis linear, starts at 0, ticks labelled with units (ms); x-axis labelled in clock time.
-- No smoothing; raw bucket values plotted. Spikes are information.
+- No smoothing; raw values plotted. Spikes are information. Gaps in data render as gaps,
+  never interpolated or fabricated.
 - Axis labels meet AA contrast against --bg (--text-dim).
 
 ### Limiter activity display
@@ -558,8 +572,8 @@ ops tool; we do not build a theme gallery.
 
 ## 8. TLS posture
 
-- Listener TLS terminates with `min_version: tls12` default; TLS 1.0/1.1 accepted only
-  when explicitly configured, and then warned loudly in logs at startup.
+- Listener TLS terminates with `min_version: tls12` default; the enum accepts
+  **only** `tls12|tls13` — TLS 1.0/1.1 are rejected by validation, full stop.
 - Upstream verification is ON by default (`verify_upstream_tls: true` implied); a
   config that sets it false produces a startup warning in both log and CLI output —
   there is no silent way to disable it.

@@ -33,4 +33,4 @@ routes:
         key: ip
         limit: 20
         window: 1m
-        burst: 8
+        burst: 30
