@@ -41,3 +41,12 @@ coverage.txt
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# local smoke-test artifacts
+up-out.log
+up-err.log
+gw-out.log
+gw-err.log
+gw-smoke.log
+gw-head.txt
+state.json

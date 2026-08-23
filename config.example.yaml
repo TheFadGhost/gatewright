@@ -1,0 +1,125 @@
+# Gatewright configuration reference example.
+# Every default is stated inline; unspecified keys take that default.
+version: 1
+
+server:
+  listen: ":8080"          # default ":8080"
+  read_timeout: 30s        # default 30s
+  write_timeout: 60s       # default 60s
+  idle_timeout: 120s       # default 120s
+  max_header_bytes: 1MiB   # default 1MiB
+  # TLS termination (omit for plain HTTP):
+  # tls:
+  #   cert_file: certs/tls.crt
+  #   key_file: certs/tls.key
+  #   min_version: tls12    # default tls12; tls10/tls11 log loud warnings
+
+admin:
+  listen: "127.0.0.1:9901" # default "127.0.0.1:9901"
+  dashboard: true          # default true
+  auth:
+    token_env: GATEWRIGHT_ADMIN_TOKEN
+    # token_env names the variable holding the bearer token; required whenever
+    # admin listens beyond loopback (validation enforces this). If neither
+    # token_env nor token_file is set, GATEWRIGHT_ADMIN_TOKEN is honoured
+    # automatically as a fail-safe default.
+    # token_file: run/secrets/admin-token   # alternative source
+
+observability:
+  access_log:
+    enabled: true          # default true
+    format: json           # json | human (default json)
+    output: stdout         # stdout | stderr | file path (default stdout)
+    fields: []             # subset of: ts req_id method path query route upstream
+                           # upstream_addr status bytes_in bytes_out duration_ms
+                           # remote code limiter_name limiter_outcome ([] = all)
+  metrics:
+    enabled: true          # default true
+    path: /metrics         # default /metrics
+  trace: false             # X-Gatewright-Trace request tracing (default false)
+
+# Shared limiter state across gateway processes. Required when any route's
+# limiter uses backend: shared.
+store:
+  path: gatewright-store.bbolt
+
+upstreams:
+  catalog:
+    targets:
+      - url: "http://127.0.0.1:9001"
+        weight: 1            # default 1; 0 = target never picked
+    load_balance: round_robin  # round_robin | least_connections | ring_hash
+    connect_timeout: 5s     # default 5s
+    read_timeout: 30s       # default 30s
+    write_timeout: 30s      # default 30s
+    keepalive: 30s          # default 30s
+    max_idle_conns_per_host: 32   # default 32
+    verify_upstream_tls: true     # default true; false logs a loud warning
+    health_check:
+      active:
+        enabled: false        # default false
+        interval: 10s         # default 10s
+        timeout: 2s           # default 2s
+        path: "/healthz"      # required when enabled
+        method: GET           # default GET
+        healthy_threshold: 2      # default 2
+        unhealthy_threshold: 3    # default 3
+        verify_tls: true          # default true
+      passive:
+        window: 30s           # default 30s
+        failures: 5           # failures within window eject target (default 5)
+        ejection_time: 30s    # default 30s
+    circuit_breaker:
+      failures: 10            # consecutive failures before opening (default 10)
+      window: 60s             # failure counting window (default 60s)
+      cooldown: 30s           # open -> half-open delay (default 30s)
+      half_open_probes: 3     # trial requests while half-open (default 3)
+
+routes:
+  - name: api-v1              # required, unique
+    hosts: ["api.example.com"]  # optional; exact or *.wildcard
+    path_prefix: "/v1/"         # optional; segment-aligned
+    methods: [GET, POST]        # optional; omitted = any method
+    match_headers: []           # optional [{name, value_regex}]
+    upstreams: catalog          # required pool name
+    strip_prefix: true          # default false
+    timeout: 15s                # total per-request deadline (default 60s)
+    body_limit: 2MiB            # size or "unlimited" (default 32MiB)
+    # mirror:                   # optional shadow traffic (fire-and-forget)
+    #   upstreams: catalog-shadow
+    #   percentage: 5           # >0 and <=100
+    # request_headers:
+    #   set: { X-Env: staging }
+    #   add: { X-Multi: v1 }
+    #   del: [ X-Debug ]
+    # cors:
+    #   allowed_origins: ["https://app.example.com"]   # or "*"
+    #   allowed_methods: [GET, POST, OPTIONS]
+    #   allowed_headers: [X-API-Key]
+    #   expose_headers: [X-Gatewright-Request-Id]
+    #   allow_credentials: true
+    #   max_age: 1h
+    # auth:
+    #   type: api_key                 # none | api_key | jwt
+    #   api_key:
+    #     header: X-API-Key
+    #     keys_env: GW_API_KEYS        # comma/newline separated; or keys_file:
+    #   jwt:
+    #     secret_env: GW_JWT_SECRET    # HS* secrets; or jwks_url for RS*/ES*
+    #     jwks_url: https://idp.example.com/.well-known/jwks.json
+    #     issuer: https://idp.example.com/
+    #     audience: gatewright-demo
+    #     algorithms: [RS256]
+    rate_limits:
+      - name: ip-burst           # unique within route
+        strategy: token_bucket   # fixed_window | sliding_window_log |
+                                 # sliding_window_counter | token_bucket |
+                                 # leaky_bucket | concurrency
+        key: ip                  # ip | path | api_key | header:<NAME> |
+                                 # composite[ip,api_key] (max 4 parts)
+        limit: 100               # required >= 1
+        window: 1m               # required except concurrency
+        burst: 20                # token_bucket capacity (default = limit)
+        cells: 10                # sliding_window_counter sub-windows (default 10)
+        max_keys: 65536          # memory bound per limiter (default 65536)
+        backend: memory          # memory | shared (default memory)

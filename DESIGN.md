@@ -216,7 +216,7 @@ transaction, and enforces the Decision invariants; strategies never touch locks.
 | --- | --- | --- | --- |
 | fixed_window | Allows up to 2×limit across a window boundary burst | ~24 B | Cheapest; boundary burst is inherent |
 | sliding_window_log | Exact | ~8 B × events in window × overhead (~48 B/event) | Most accurate, heaviest; bound events/key via limit only |
-| sliding_window_counter | Approximate (±limit/cells typical) | ~32 B | Good middle ground; cells tunable |
+| sliding_window_counter | Approximate (±limit/cells typical) | ~32 B | Good middle ground; cells tunable. When denied by cost>1, `Remaining` reports the usable units honestly rather than forcing 0 |
 | token_bucket | Exact refill semantics; sustained rate + bursts | ~48 B | Refill limit/window; burst capacity configurable |
 | leaky_bucket | Exact drain semantics; smooths output rate | ~48 B | Capacity bounds queue-like bursts |
 | concurrency | Exact live count (per process, or per shared store) | ~16 B + waiter set | Must be paired with `Releaser` usage |
@@ -446,6 +446,14 @@ Documented, enforced in code, visible in trace mode:
 Retries: GET/HEAD/OPTIONS/PUT/DELETE/TRACE only; never retried once the response has
 started streaming to the client; bodies replayable only when buffered ≤ 8 KiB.
 Backoff: base 25 ms, factor 2, ±50 % uniform jitter, attempts default 3 (1 retry).
+
+Request trace mode (`observability.trace: true`, request header `X-Gatewright-Trace: 1`):
+the `X-Gatewright-Trace` response header reports the matched route plus the stage
+timings that completed before the upstream responded (header emission is bound to the
+response, so post-forward stages cannot appear there). The complete pipeline — every
+stage with inclusive durations in completion order — is emitted as a structured
+`request-trace` log event with `req_id`, `route`, `status` and `stages`. Stage timings
+are inclusive: an outer stage's duration contains all inner work.
 
 ---
 

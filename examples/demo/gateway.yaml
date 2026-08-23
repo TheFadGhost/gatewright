@@ -1,0 +1,36 @@
+# Runnable local demo: gateway on :8090 -> demo upstream on :9001.
+# Start it with:
+#   gatewright demo-upstream -a 127.0.0.1:9001 &
+#   gatewright run -c examples/demo/gateway.yaml
+version: 1
+
+server:
+  listen: ":8090"
+
+admin:
+  listen: "127.0.0.1:9901"
+  dashboard: true
+  auth:
+    token_env: GATEWRIGHT_ADMIN_TOKEN
+
+observability:
+  trace: true
+
+upstreams:
+  demo:
+    targets:
+      - url: "http://127.0.0.1:9001"
+        weight: 1
+
+routes:
+  - name: demo
+    path_prefix: "/"
+    upstreams: demo
+    timeout: 10s
+    rate_limits:
+      - name: ip-quota
+        strategy: token_bucket
+        key: ip
+        limit: 20
+        window: 1m
+        burst: 8
