@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
@@ -101,5 +102,23 @@ func TestValidRequestIDBoundaries(t *testing.T) {
 		if got := ValidRequestID(in); got != want {
 			t.Fatalf("ValidRequestID(%q) = %v, want %v", in, got, want)
 		}
+	}
+}
+
+func TestFromContextReadsInstalledID(t *testing.T) {
+	if got := FromContext(context.Background()); got != "" {
+		t.Fatalf("FromContext(background) = %q, want empty", got)
+	}
+	var viaHelper string
+	h := NewRequestID()(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		viaHelper = FromContext(r.Context())
+	}))
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/", nil))
+	if !gwIDPattern.MatchString(viaHelper) {
+		t.Fatalf("FromContext = %q, want generated gw-* id", viaHelper)
+	}
+	ctx := WithRequestID(context.Background(), "explicit-id")
+	if got := FromContext(ctx); got != "explicit-id" {
+		t.Fatalf("FromContext = %q, want explicit-id", got)
 	}
 }

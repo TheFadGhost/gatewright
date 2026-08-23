@@ -7,24 +7,11 @@ import (
 	"io"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
-
-// knownFieldSet is the fixed access-log vocabulary.
-var knownFieldSet = func() map[string]int {
-	m := map[string]int{}
-	fields := []string{
-		"ts", "req_id", "method", "path", "query", "route", "upstream",
-		"upstream_addr", "status", "bytes_in", "bytes_out", "duration_ms",
-		"remote", "code", "limiter_name", "limiter_outcome",
-	}
-	for i, f := range fields {
-		m[f] = i
-	}
-	return m
-}()
 
 type stdLogger struct {
 	mu     sync.Mutex
@@ -50,7 +37,7 @@ func newLogger(opts Options) (Logger, error) {
 	}
 	fieldFilter := map[string]bool{}
 	for _, f := range opts.Fields {
-		if _, ok := knownFieldSet[f]; ok {
+		if ValidAccessLogField(f) {
 			fieldFilter[f] = true
 		}
 	}
@@ -128,42 +115,62 @@ func (l *stdLogger) Error(msg string, kv ...any) { l.log("error", msg, kv) }
 func (l *stdLogger) Access(f AccessFields) {
 	if l.json {
 		m := map[string]any{}
-		put := func(key string, v any) {
-			if len(l.fields) > 0 && !l.fields[key] {
-				return
+		selected := func(key string) bool { return len(l.fields) == 0 || l.fields[key] }
+		// Core envelope keys are never filtered out.
+		m["ts"] = orDefault(f.TS, time.Now().UTC().Format(time.RFC3339Nano))
+		m["level"] = "info"
+		m["msg"] = "access"
+		str := func(key, v string) {
+			if selected(key) && v != "" { // zero-value strings are omitted
+				m[key] = v
 			}
-			m[key] = v
 		}
-		put("ts", orDefault(f.TS, time.Now().UTC().Format(time.RFC3339Nano)))
-		put("level", "info")
-		put("msg", "access")
-		put("req_id", f.ReqID)
-		put("method", f.Method)
-		put("path", f.Path)
-		put("query", f.Query)
-		put("route", f.Route)
-		put("upstream", f.Upstream)
-		put("upstream_addr", f.UpstreamAddr)
-		put("status", f.Status)
-		put("bytes_in", f.BytesIn)
-		put("bytes_out", f.BytesOut)
-		put("duration_ms", f.DurationMS)
-		put("remote", f.Remote)
-		put("code", f.Code)
-		put("limiter_name", f.LimiterName)
-		put("limiter_outcome", f.LimiterOutcome)
+		num := func(key string, v any) {
+			if selected(key) {
+				m[key] = v
+			}
+		}
+		str("req_id", f.ReqID)
+		str("method", f.Method)
+		str("path", f.Path)
+		str("query", f.Query)
+		str("route", f.Route)
+		str("upstream", f.Upstream)
+		str("upstream_addr", f.UpstreamAddr)
+		num("status", f.Status)
+		num("bytes_in", f.BytesIn)
+		num("bytes_out", f.BytesOut)
+		num("duration_ms", f.DurationMS)
+		str("remote", f.Remote)
+		str("code", f.Code)
+		str("limiter_name", f.LimiterName)
+		str("limiter_outcome", f.LimiterOutcome)
 		buf := bytes.Buffer{}
 		_ = json.NewEncoder(&buf).Encode(m)
 		l.write(buf.Bytes())
 		return
 	}
+
+	// Human mode: the core four (ts, req_id, status, duration_ms) are always
+	// present; every other configured field renders as a sorted key=value
+	// pair with empty-string values omitted, mirroring the JSON filter.
 	dur := fmt.Sprintf("%.1fms", f.DurationMS)
-	line := fmt.Sprintf("%s INF req_id=%s %s %s route=%s upstream=%s status=%d dur=%s out=%dB remote=%s\n",
-		orDefault(f.TS, time.Now().UTC().Format(time.RFC3339)),
-		orDefault(f.ReqID, "-"), f.Method, f.Path,
-		orDefault(f.Route, "-"), orDefault(f.Upstream, "-"),
-		f.Status, dur, f.BytesOut, orDefault(f.Remote, "-"),
-	)
+	var b strings.Builder
+	b.WriteString(orDefault(f.TS, time.Now().UTC().Format(time.RFC3339)))
+	b.WriteString(" INF req_id=")
+	b.WriteString(orDefault(f.ReqID, "-"))
+	b.WriteString(" status=")
+	b.WriteString(strconv.Itoa(f.Status))
+	b.WriteString(" duration_ms=")
+	b.WriteString(dur)
+	pairs := humanPairs(l.fields, f)
+	sort.Strings(pairs)
+	for _, p := range pairs {
+		b.WriteString(" ")
+		b.WriteString(p)
+	}
+	b.WriteString("\n")
+	line := b.String()
 	if l.colour {
 		switch {
 		case f.Status >= 500:
@@ -173,6 +180,36 @@ func (l *stdLogger) Access(f AccessFields) {
 		}
 	}
 	l.write([]byte(line))
+}
+
+// humanPairs renders the optional access fields as key=value pairs honouring
+// the configured subset and omitting empty-string values. The core four
+// (ts/req_id/status/duration_ms) are handled by Access itself.
+func humanPairs(fields map[string]bool, f AccessFields) []string {
+	selected := func(key string) bool { return len(fields) == 0 || fields[key] }
+	pairs := make([]string, 0, 12)
+	add := func(key, v string) {
+		if selected(key) && v != "" {
+			pairs = append(pairs, key+"="+v)
+		}
+	}
+	add("method", f.Method)
+	add("path", f.Path)
+	add("query", f.Query)
+	add("route", f.Route)
+	add("upstream", f.Upstream)
+	add("upstream_addr", f.UpstreamAddr)
+	if selected("bytes_in") {
+		pairs = append(pairs, fmt.Sprintf("bytes_in=%d", f.BytesIn))
+	}
+	if selected("bytes_out") {
+		pairs = append(pairs, fmt.Sprintf("bytes_out=%d", f.BytesOut))
+	}
+	add("remote", f.Remote)
+	add("code", f.Code)
+	add("limiter_name", f.LimiterName)
+	add("limiter_outcome", f.LimiterOutcome)
+	return pairs
 }
 
 func orDefault(v, def string) string {

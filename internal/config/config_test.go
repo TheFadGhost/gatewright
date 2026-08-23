@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	_ "gatewright/internal/limiter/builtin" // registers strategies so validation sees the known set
 	"gatewright/internal/limiter"
+	_ "gatewright/internal/limiter/builtin" // registers strategies so validation sees the known set
 	"gopkg.in/yaml.v3"
 )
 
@@ -453,7 +453,7 @@ admin:
 			},
 		},
 		{
-			name: "tls10 accepted but flagged unsafe",
+			name: "tls10 rejected outright (TLS 1.2 floor)",
 			doc: `
 version: 1
 server:
@@ -463,15 +463,115 @@ server:
     min_version: tls10
 `,
 			path: "server.tls.min_version",
-			code: CodeUnsafeCombination,
+			code: CodeInvalidValue,
 			want: func(t *testing.T, e *Error) {
-				if e.Found != "tls10" {
+				if !strings.Contains(e.Found, "tls10") {
 					t.Errorf("Found = %q", e.Found)
 				}
-				if !strings.Contains(e.Hint, "deprecated") {
-					t.Errorf("Hint = %q", e.Hint)
+				if !strings.Contains(e.Expected, "tls12") || !strings.Contains(e.Expected, "tls13") {
+					t.Errorf("Expected = %q, want the accepted enum", e.Expected)
+				}
+				if !strings.Contains(e.Hint, "1.2") {
+					t.Errorf("Hint = %q, want the migration hint", e.Hint)
 				}
 			},
+		},
+		{
+			name: "route name outside bucket-safe charset",
+			doc: doc(`
+routes:
+  - name: "bad name!"
+    upstreams: api
+`),
+			path: "routes[0].name",
+			code: CodeInvalidValue,
+			want: func(t *testing.T, e *Error) {
+				if !strings.Contains(e.Hint, "bucket") {
+					t.Errorf("Hint = %q, want the storage-bucket rationale", e.Hint)
+				}
+			},
+		},
+		{
+			name: "limiter name with slash rejected",
+			doc: doc(`
+routes:
+  - name: r1
+    upstreams: api
+    rate_limits:
+      - name: "a/b"
+        strategy: fixed_window
+        limit: 5
+        window: 10s
+        key: ip
+`),
+			path: "routes[0].rate_limits[0].name",
+			code: CodeInvalidValue,
+		},
+		{
+			name: "mirror percentage NaN",
+			doc: doc(`
+routes:
+  - name: r1
+    upstreams: api
+    mirror:
+      upstreams: api
+      percentage: .nan
+`),
+			path: "routes[0].mirror.percentage",
+			code: CodeInvalidValue,
+			want: func(t *testing.T, e *Error) {
+				if e.Found != "NaN" {
+					t.Errorf("Found = %q, want \"NaN\"", e.Found)
+				}
+			},
+		},
+		{
+			name: "mirror percentage +Inf",
+			doc: doc(`
+routes:
+  - name: r1
+    upstreams: api
+    mirror:
+      upstreams: api
+      percentage: .inf
+`),
+			path: "routes[0].mirror.percentage",
+			code: CodeInvalidValue,
+		},
+		{
+			name: "response header value with CRLF injection",
+			// The \r\n pair arrives through YAML escape sequences on ONE
+			// line, so the parser accepts the scalar and validation must
+			// reject the control characters it decodes to.
+			doc: doc(`routes:
+  - name: r1
+    upstreams: api
+    response_headers:
+      set:
+        X-Env: "stage\r\nX-Evil: 1"
+`),
+			path: "routes[0].response_headers.set.X-Env",
+			code: CodeInvalidValue,
+			want: func(t *testing.T, e *Error) {
+				if !strings.Contains(e.Expected, "printable ASCII") {
+					t.Errorf("Expected = %q", e.Expected)
+				}
+			},
+		},
+		{
+			name: "jwks_url with non-http scheme",
+			doc: doc(`
+routes:
+  - name: r1
+    upstreams: api
+    auth:
+      type: jwt
+      jwt:
+        jwks_url: httpfoo://id.example.com/jwks.json
+        algorithms: [RS256]
+`),
+			path: "routes[0].auth.jwt.jwks_url",
+			code: CodeInvalidValue,
 		},
 		{
 			name: "jwt HS algorithms paired with jwks_url",
@@ -819,11 +919,11 @@ func TestBodyLimitRoundtrip(t *testing.T) {
 
 func TestParseKeySpecCanonicalForms(t *testing.T) {
 	cases := []struct {
-		in       string
-		kind     string
-		header   string
+		in        string
+		kind      string
+		header    string
 		canonical string // KeySpec.String()
-		parts    int
+		parts     int
 	}{
 		{"ip", "ip", "", "ip", 1},
 		{" IP ", "ip", "", "ip", 1},

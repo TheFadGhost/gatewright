@@ -16,6 +16,7 @@ import (
 
 	"gatewright/internal/config"
 	"gatewright/internal/errs"
+	"gatewright/internal/middleware"
 	"gatewright/internal/obs"
 	"gatewright/internal/pool"
 )
@@ -44,6 +45,12 @@ type ForwarderOpts struct {
 	Logger          obs.Logger      // optional, may be nil
 	Retry           RetryPolicy
 	TraceEnabled    bool
+	// HashKey is the pool's key specification ("ip", "path", "api_key",
+	// "header:X", or composite[...]) used with ring_hash load balancing. When
+	// set, requests are keyed exactly like middleware key extractors; when
+	// empty, the client IP remains the key (legacy behaviour). Invalid specs
+	// are ignored (config validation catches them earlier).
+	HashKey string
 }
 
 // Forwarder proxies requests to a route's pool: streaming bodies, hop-by-hop
@@ -53,7 +60,8 @@ type ForwarderOpts struct {
 type Forwarder struct {
 	opts        ForwarderOpts
 	rp          *httputil.ReverseProxy
-	targetCache sync.Map // string -> *url.URL
+	keyFn       middleware.KeyExtractor // non-nil when opts.HashKey parses
+	targetCache sync.Map                // string -> *url.URL
 	bufPool     sync.Pool
 }
 
@@ -62,9 +70,9 @@ const (
 	// retries (DESIGN.md §6: "bodies replayable only when buffered <= 8 KiB").
 	maxReplayBodyBytes = 8 * 1024
 
-	mirrorTimeout    = 5 * time.Second  // shadow traffic never blocks the client
-	mirrorDrainLimit = 1 << 20          // cap drain so mirrors can't stall goroutines
-	copyBufSize      = 32 * 1024        // ReverseProxy buffer-pool chunk size
+	mirrorTimeout    = 5 * time.Second // shadow traffic never blocks the client
+	mirrorDrainLimit = 1 << 20         // cap drain so mirrors can't stall goroutines
+	copyBufSize      = 32 * 1024       // ReverseProxy buffer-pool chunk size
 )
 
 // NewForwarder builds a forwarder, normalizing retry defaults
@@ -84,6 +92,13 @@ func NewForwarder(o ForwarderOpts) *Forwarder {
 	}
 	f := &Forwarder{opts: o}
 	f.bufPool.New = func() any { return make([]byte, copyBufSize) }
+	if o.HashKey != "" {
+		if spec, err := config.ParseKeySpec(o.HashKey); err == nil {
+			if fn, err := middleware.BuildKeyExtractor(*spec); err == nil {
+				f.keyFn = fn
+			}
+		}
+	}
 
 	f.rp = &httputil.ReverseProxy{
 		Rewrite:        f.rewrite,
@@ -98,7 +113,7 @@ func NewForwarder(o ForwarderOpts) *Forwarder {
 
 type bufPool struct{ p *sync.Pool }
 
-func (b *bufPool) Get() []byte { return b.p.Get().([]byte) }
+func (b *bufPool) Get() []byte  { return b.p.Get().([]byte) }
 func (b *bufPool) Put(x []byte) { b.p.Put(x) }
 
 // ---------------------------------------------------------------------------
@@ -108,7 +123,14 @@ func (b *bufPool) Put(x []byte) { b.p.Put(x) }
 // ServeHTTP performs the full proxy handling for one routed request.
 func (f *Forwarder) ServeHTTP(w http.ResponseWriter, r *http.Request, rm *RouteMatch) {
 	plan := planBody(r)
-	upPath := f.upstreamPath(r, rm)
+	incoming := cleanRequestPath(r.URL.EscapedPath())
+	if pathHasDotSegments(incoming) {
+		// Identical rule to Router.Match so the routed/authenticated view of
+		// the path and the forwarded target can never disagree.
+		f.writeError(w, r, errs.CodeInvalidPath, "invalid request path")
+		return
+	}
+	upPath := f.upstreamPath(incoming, rm)
 
 	f.maybeMirror(r, plan, upPath)
 
@@ -119,7 +141,7 @@ func (f *Forwarder) ServeHTTP(w http.ResponseWriter, r *http.Request, rm *RouteM
 	}
 
 	for attempt := 0; ; attempt++ {
-		tgt, err := f.opts.Pool.Pick(hashKey(r))
+		tgt, err := f.opts.Pool.Pick(f.pickKey(r))
 		if err != nil {
 			f.writeError(w, r, errs.CodeNoHealthyUpstream, "no healthy upstream available")
 			return
@@ -145,9 +167,18 @@ func (f *Forwarder) ServeHTTP(w http.ResponseWriter, r *http.Request, rm *RouteM
 			}
 		}
 
+		// ReverseProxy panics http.ErrAbortHandler when a response aborts
+		// mid-stream; it MUST propagate unwrapped so the outermost
+		// recover middleware can special-case it. Never wrap this call in
+		// defer/recover here.
 		f.rp.ServeHTTP(w, req)
 
 		outcome, code, msg := resolveAttempt(st)
+		// A client disconnect is the caller's business, never the target's:
+		// classify it ErrCanceled so passive health and the breaker ignore it.
+		if !outcome.Success && r.Context().Err() == context.Canceled {
+			outcome.ErrClass = pool.ErrCanceled
+		}
 		f.opts.Pool.Done(tgt, outcome)
 		if cancel != nil {
 			cancel()
@@ -257,7 +288,8 @@ func resolveAttempt(st *attemptState) (pool.Outcome, string, string) {
 // classifyTransport maps transport failures onto pool.ErrClass values and the
 // stable client-facing codes: dial/TLS/refused/reset => ErrConnect (UP010),
 // malformed/EOF responses => ErrResponse (UP010), deadlines => ErrTimeout
-// (UP004 total route timeout).
+// (UP004 total route timeout), client disconnects => ErrCanceled (never held
+// against the target).
 func classifyTransport(err error) (pool.ErrClass, string, string) {
 	if errors.Is(err, context.DeadlineExceeded) {
 		return pool.ErrTimeout, errs.CodeTotalTimeout, "total route timeout exceeded"
@@ -267,7 +299,7 @@ func classifyTransport(err error) (pool.ErrClass, string, string) {
 		return pool.ErrTimeout, errs.CodeTotalTimeout, "upstream timeout"
 	}
 	if errors.Is(err, context.Canceled) {
-		return pool.ErrConnect, errs.CodeBadGateway, "request canceled"
+		return pool.ErrCanceled, errs.CodeBadGateway, "request canceled"
 	}
 	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 		return pool.ErrResponse, errs.CodeBadGateway, "malformed upstream response"
@@ -296,8 +328,21 @@ func (f *Forwarder) backoff(attempt int) time.Duration {
 	return jittered
 }
 
-// hashKey derives the ring-hash key from the client IP ("": no key). Pool
-// HashKey resolution stays with the caller-configured pools.
+// pickKey derives the ring-hash key for a request. When opts.HashKey names a
+// spec, the middleware key extractor builds it (identical semantics to rate
+// limiting: ip/path/api_key/header:X/composite); otherwise the client IP is
+// the key ("" when unusable). Pool HashKey resolution stays with the
+// caller-configured pools.
+func (f *Forwarder) pickKey(r *http.Request) string {
+	if f.keyFn != nil {
+		id, _ := middleware.IdentityFrom(r.Context())
+		return f.keyFn(r, id)
+	}
+	return hashKey(r)
+}
+
+// hashKey derives the legacy ring-hash key from the client IP ("" when no
+// usable address exists).
 func hashKey(r *http.Request) string {
 	ip, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
@@ -310,11 +355,12 @@ func hashKey(r *http.Request) string {
 // Path building
 // ---------------------------------------------------------------------------
 
-// upstreamPath computes the escaped, cleaned incoming path with the route's
+// upstreamPath returns the cleaned escaped incoming path with the route's
 // matched prefix stripped when strip_prefix is configured. Prefix stripping
-// is segment-aligned (MatchedPrefix never matches "/v1x" for "/v1").
-func (f *Forwarder) upstreamPath(r *http.Request, rm *RouteMatch) string {
-	incoming := cleanRequestPath(r.URL.EscapedPath())
+// is segment-aligned (MatchedPrefix never matches "/v1x" for "/v1"). The
+// caller has already rejected dot-segment paths, so what lands here is the
+// exact path Match authenticated against.
+func (f *Forwarder) upstreamPath(incoming string, rm *RouteMatch) string {
 	if !f.opts.StripPrefix {
 		return incoming
 	}
@@ -647,7 +693,13 @@ func (f *Forwarder) writeError(w http.ResponseWriter, r *http.Request, code, mes
 		code = errs.CodeBadGateway
 		message = "bad gateway"
 	}
-	errs.WriteWithID(w, errs.New(code, message), r.Header.Get("X-Gatewright-Request-Id"))
+	// Context first (installed by the request-id middleware), header fallback
+	// for direct forwarder use without the full chain.
+	reqID := middleware.FromContext(r.Context())
+	if reqID == "" {
+		reqID = r.Header.Get(middleware.RequestIDHeader)
+	}
+	errs.WriteWithID(w, errs.New(code, message), reqID)
 	f.warn("proxy_error", "code", code, "message", message)
 }
 

@@ -5,7 +5,6 @@ package obs
 import (
 	"io"
 	"os"
-	"sync/atomic"
 )
 
 // Logger writes structured events. Implementations must be safe for
@@ -24,7 +23,7 @@ type Logger interface {
 // AccessFields is the fixed access-log schema (DESIGN.md §4). Zero values are
 // omitted per the configured field subset; names never change.
 type AccessFields struct {
-	TS             string  // RFC3339Nano
+	TS             string // RFC3339Nano
 	ReqID          string
 	Method         string
 	Path           string
@@ -69,7 +68,21 @@ func New(opts Options) (Logger, error) {
 	return newLogger(opts)
 }
 
-var logCounter atomic.Uint64 // request correlation fallback when no req id
+// AccessLogFields is the fixed access-log vocabulary (DESIGN.md §4). It is
+// the single source of truth shared by config validation and the logger's
+// field filter; names never change.
+var AccessLogFields = []string{
+	"ts", "req_id", "method", "path", "query", "route", "upstream",
+	"upstream_addr", "status", "bytes_in", "bytes_out", "duration_ms",
+	"remote", "code", "limiter_name", "limiter_outcome",
+}
 
-// NextSeq returns a process-unique sequence number for log lines.
-func NextSeq() uint64 { return logCounter.Add(1) }
+// ValidAccessLogField reports whether name is part of the fixed vocabulary.
+func ValidAccessLogField(name string) bool {
+	for _, f := range AccessLogFields {
+		if f == name {
+			return true
+		}
+	}
+	return false
+}

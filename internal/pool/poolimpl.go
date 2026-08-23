@@ -49,11 +49,11 @@ type poolImpl struct {
 // New builds a pool from validated upstream configuration.
 func New(cfg Config) *poolImpl {
 	p := &poolImpl{
-		name:     cfg.Name,
-		cfg:      cfg,
-		byPtr:    make(map[*Target]*targetState, len(cfg.Targets)),
-		stopCh:   make(chan struct{}),
-		nowFunc:  func() time.Time { return time.Now() },
+		name:      cfg.Name,
+		cfg:       cfg,
+		byPtr:     make(map[*Target]*targetState, len(cfg.Targets)),
+		stopCh:    make(chan struct{}),
+		nowFunc:   func() time.Time { return time.Now() },
 		transport: buildTransport(cfg),
 	}
 	for i, tc := range cfg.Targets {

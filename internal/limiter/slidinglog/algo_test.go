@@ -165,11 +165,11 @@ func TestStateRoundTrip(t *testing.T) {
 // TestCheckerAndRegistration exercises the registered checker via
 // limiter.CheckSettings and confirms factory registration.
 func TestCheckerAndRegistration(t *testing.T) {
-	if !limiter.Has(StrategyName) {
-		t.Fatalf("%s not registered", StrategyName)
+	if !limiter.Has(strategyName) {
+		t.Fatalf("%s not registered", strategyName)
 	}
 	valid := limiter.Settings{Limit: 10, Window: time.Second}
-	if probs := limiter.CheckSettings(StrategyName, valid); len(probs) != 0 {
+	if probs := limiter.CheckSettings(strategyName, valid); len(probs) != 0 {
 		t.Fatalf("valid settings rejected: %v", probs)
 	}
 	cases := []struct {
@@ -182,9 +182,9 @@ func TestCheckerAndRegistration(t *testing.T) {
 		{"both bad", limiter.Settings{}, 2},
 	}
 	for _, tc := range cases {
-		if got := len(limiter.CheckSettings(StrategyName, tc.s)); got != tc.want {
+		if got := len(limiter.CheckSettings(strategyName, tc.s)); got != tc.want {
 			t.Fatalf("%s: got %d problems (%v), want %d", tc.name, got,
-				limiter.CheckSettings(StrategyName, tc.s), tc.want)
+				limiter.CheckSettings(strategyName, tc.s), tc.want)
 		}
 	}
 }

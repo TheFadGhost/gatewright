@@ -9,12 +9,13 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"gatewright/internal/config"
-	_ "gatewright/internal/limiter/builtin" // registers strategies for validation & engines
 	"gatewright/internal/limiter"
+	_ "gatewright/internal/limiter/builtin" // registers strategies for validation & engines
 	"gatewright/internal/obs"
 )
 
@@ -325,20 +326,12 @@ func TestSinkAggregationCountersAndPerSec(t *testing.T) {
 		t.Fatal("perSec lost track of a known limiter")
 	}
 
-	// KNOWN QUIRK (not fixed here: test-only change policy): perSec computes
-	// seconds := time.Duration(len(ring)-1).Seconds(), i.e. it treats the
-	// sample COUNT as a nanosecond duration, so every rate comes back scaled
-	// by 1e9 relative to true per-second deltas. The assertions below pin the
-	// current formula exactly; if the unit bug is ever fixed, these are the
-	// lines to flip to plain "4" and "1".
-	nsSeconds := time.Duration(len(agg.samples[key]) - 1).Seconds()
-	wantAllowed := float64(7-3) / nsSeconds
-	wantLimited := float64(3-2) / nsSeconds
-	if aRate != wantAllowed {
-		t.Errorf("allowed/sec = %v, want %v", aRate, wantAllowed)
+	// Two ticks one second apart => deltas over exactly n=1 seconds.
+	if aRate != 4 {
+		t.Errorf("allowed/sec = %v, want 4", aRate)
 	}
-	if lRate != wantLimited {
-		t.Errorf("limited/sec = %v, want %v", lRate, wantLimited)
+	if lRate != 1 {
+		t.Errorf("limited/sec = %v, want 1", lRate)
 	}
 	if evictions != 2 {
 		t.Errorf("evictions = %d, want 2", evictions)
@@ -380,5 +373,305 @@ func TestSinkPerSecUnknownKeyNotOK(t *testing.T) {
 	keys := agg.sortedKeys()
 	if len(keys) != 0 {
 		t.Errorf("sortedKeys on empty sink = %v", keys)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// M6: shared-store failures fail CLOSED with telemetry and a single warning.
+// ---------------------------------------------------------------------------
+
+type brokenStore struct{}
+
+func (brokenStore) Update(string, time.Duration, string,
+	func(prev []byte, existed bool) (next []byte)) error {
+	return errors.New("bbolt: database not open")
+}
+
+func (brokenStore) Close() error { return nil }
+
+type warnRecorder struct {
+	mu   sync.Mutex
+	msgs []string
+}
+
+func (w *warnRecorder) Warn(msg string, kv ...any) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.msgs = append(w.msgs, msg)
+}
+
+func (w *warnRecorder) count() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return len(w.msgs)
+}
+
+func TestEngineFailsClosedWhenSharedStoreUnavailable(t *testing.T) {
+	agg := newSinkAgg(nil)
+	logger := &warnRecorder{}
+	l, err := limiter.New("fixed_window", limiter.Params{
+		Route: "r1", Name: "quota",
+		Settings: limiter.Settings{Limit: 7, Window: time.Minute},
+		Backend:  brokenStore{},
+		Metrics:  agg,
+		Logger:   logger,
+	})
+	if err != nil {
+		t.Fatalf("limiter.New: %v", err)
+	}
+
+	for i := 1; i <= 2; i++ {
+		d := l.Allow("10.0.0.1", time.Now(), 1)
+		if d.Allowed {
+			t.Fatalf("call %d admitted traffic while the store is down", i)
+		}
+		if d.RetryAfter != 500*time.Millisecond {
+			t.Errorf("call %d RetryAfter = %v, want 500ms", i, d.RetryAfter)
+		}
+		if d.Limit != 7 {
+			t.Errorf("call %d Limit = %d, want the configured 7", i, d.Limit)
+		}
+	}
+
+	key := aggKey("r1", "quota", "fixed_window")
+	if got := agg.storeErrorsFor(key); got != 2 {
+		t.Errorf("ObserveStoreError count = %d, want 2", got)
+	}
+	if logger.count() != 1 {
+		t.Errorf("warning emitted %d times, want exactly once per process", logger.count())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// L2: memory-driver capacity pressure surfaces as ObserveEviction.
+// ---------------------------------------------------------------------------
+
+func TestMemoryDriverEvictionTelemetryViaPublicAllow(t *testing.T) {
+	inner := newCaptureSink()
+	agg := newSinkAgg(inner)
+	l, err := limiter.New("fixed_window", limiter.Params{
+		Route: "r1", Name: "bursty",
+		Settings: limiter.Settings{Limit: 1000, Window: time.Hour},
+		MaxKeys:  16,
+		Metrics:  agg,
+	})
+	if err != nil {
+		t.Fatalf("limiter.New: %v", err)
+	}
+	now := time.Now()
+	for i := 0; i < 1000; i++ {
+		l.Allow(fmt.Sprintf("key-%d", i), now, 1)
+	}
+	key := aggKey("r1", "bursty", "fixed_window")
+	if inner.evictions[key] == 0 {
+		t.Fatal("1000 keys against MaxKeys=16 produced no ObserveEviction events")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// M14: changing store.path is rejected instead of silently reopening state.
+// ---------------------------------------------------------------------------
+
+const sharedBackendConfigTmpl = `version: 1
+server:
+  listen: "127.0.0.1:0"
+admin:
+  listen: "127.0.0.1:0"
+store:
+  path: %q
+upstreams:
+  api:
+    targets:
+      - url: %q
+        weight: 1
+routes:
+  - name: r1
+    path_prefix: /api
+    upstreams: api
+    rate_limits:
+      - name: quota
+        strategy: fixed_window
+        key: ip
+        limit: 5
+        window: 30s
+        backend: shared
+`
+
+func TestReloadRejectsChangingStorePath(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer up.Close()
+
+	dir := t.TempDir()
+	storeA := filepath.Join(dir, "a.bbolt")
+	storeB := filepath.Join(dir, "b.bbolt")
+
+	sup, metrics, cfgPath := newTestSupervisor(t,
+		fmt.Sprintf(sharedBackendConfigTmpl, storeA, up.URL))
+	// Release the exclusive bbolt handle so Windows can delete the temp dir.
+	t.Cleanup(func() { sup.Drain(time.Second) })
+	handler := sup.Handler()
+
+	writeFile(t, cfgPath, fmt.Sprintf(sharedBackendConfigTmpl, storeB, up.URL))
+	err := sup.Reload()
+	if err == nil {
+		t.Fatal("reload must reject a changed store.path")
+	}
+	if !strings.Contains(err.Error(), "store.path changes require a restart") {
+		t.Errorf("error = %v, want the restart-required message", err)
+	}
+	if !strings.Contains(err.Error(), storeA) {
+		t.Errorf("error = %v, want the current path %q for diagnosis", err, storeA)
+	}
+
+	// The rejection is counted and the old generation still serves.
+	if rec := serveGet(handler, "http://gateway/api/ping"); rec.Code != http.StatusOK {
+		t.Errorf("old generation status = %d after rejected reload", rec.Code)
+	}
+	render := metrics.Render()
+	if !strings.Contains(render, `gatewright_reloads_total{outcome="rejected"} 1`) {
+		t.Errorf("rejected reload not counted:\n%s", render)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// M8: generation references keep a swapped-out runtime alive; drain waits.
+// ---------------------------------------------------------------------------
+
+func TestReloadKeepsServingInFlightRequestOnOldGeneration(t *testing.T) {
+	var entered atomic.Bool
+	release := make(chan struct{})
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/hold" {
+			entered.Store(true)
+			select {
+			case <-release:
+			case <-time.After(10 * time.Second):
+			}
+		}
+		_, _ = w.Write([]byte("done"))
+	}))
+	defer up.Close()
+
+	sup, _, cfgPath := newTestSupervisor(t, fmt.Sprintf(baseConfigTmpl, up.URL))
+	srv := httptest.NewServer(sup.Handler())
+	defer srv.Close()
+
+	done := make(chan int, 1)
+	go func() {
+		resp, err := (&http.Client{Timeout: 15 * time.Second}).Get(srv.URL + "/api/hold")
+		if err != nil {
+			done <- -1
+			return
+		}
+		resp.Body.Close()
+		done <- resp.StatusCode
+	}()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for !entered.Load() && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !entered.Load() {
+		t.Fatal("request never reached the blocking upstream")
+	}
+
+	// Swap generations while the request holds a reference on the old one.
+	writeFile(t, cfgPath, fmt.Sprintf(baseConfigTmpl, up.URL)+"# reloaded\n")
+	if err := sup.Reload(); err != nil {
+		t.Fatalf("reload during in-flight request: %v", err)
+	}
+
+	close(release)
+	select {
+	case code := <-done:
+		if code != http.StatusOK {
+			t.Fatalf("in-flight request across reload: status = %d, want 200", code)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("in-flight request never completed after reload")
+	}
+
+	// New requests land on the new generation without issue.
+	if rec := serveGet(sup.Handler(), "http://gateway/api/after"); rec.Code != http.StatusOK {
+		t.Errorf("post-reload request status = %d, want 200", rec.Code)
+	}
+
+	// Drain must return promptly once nothing is in flight (no wg deadlock).
+	drainDone := make(chan struct{})
+	go func() { sup.Drain(2 * time.Second); close(drainDone) }()
+	select {
+	case <-drainDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Drain did not return with zero in-flight requests")
+	}
+	// After Drain the acquire path is removed: Handler answers 503.
+	if rec := serveGet(sup.Handler(), "http://gateway/api/post-drain"); rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("request after Drain status = %d, want 503", rec.Code)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// M10: the process logger is built from configuration, not hardcoded wiring.
+// ---------------------------------------------------------------------------
+
+func TestNewLoggerFromConfigRespectsAccessLogSettings(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "access.log")
+	cfg := &config.Config{}
+	cfg.Observability.AccessLog.Format = "json"
+	cfg.Observability.AccessLog.Output = logPath
+	cfg.Observability.AccessLog.Fields = []string{"req_id", "status"}
+
+	logger, err := NewLoggerFromConfig(cfg, true, false)
+	if err != nil {
+		t.Fatalf("NewLoggerFromConfig: %v", err)
+	}
+	if f, ok := logger.Writer().(*os.File); ok {
+		t.Cleanup(func() { _ = f.Close() })
+	}
+	if logger.Writer() == nil {
+		t.Fatal("logger writer is nil")
+	}
+
+	// The configured field subset must survive into the emitted JSON.
+	logger.Access(obs.AccessFields{ReqID: "r-1", Method: "GET",
+		Path: "/x", Route: "hidden", Status: 200})
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	line := strings.TrimSpace(string(data))
+	for _, want := range []string{`"req_id":"r-1"`, `"status":200`} {
+		if !strings.Contains(line, want) {
+			t.Errorf("log line missing %s:\n%s", want, line)
+		}
+	}
+	for _, banned := range []string{`"route"`, `"method"`} {
+		if strings.Contains(line, banned) {
+			t.Errorf("unselected field %s leaked:\n%s", banned, line)
+		}
+	}
+}
+
+func TestNewLoggerFromConfigDefaultsAndErrors(t *testing.T) {
+	// Empty format/output default to json/stdout without error.
+	cfg := &config.Config{}
+	l, err := NewLoggerFromConfig(cfg, false, false)
+	if err != nil {
+		t.Fatalf("defaults: %v", err)
+	}
+	if l.Writer() != os.Stdout {
+		t.Errorf("default output = %T, want stdout", l.Writer())
+	}
+
+	// An unwritable file output surfaces as an error, not a silent drop.
+	bad := filepath.Join(t.TempDir(), "missing-dir", "x.log")
+	cfg2 := &config.Config{}
+	cfg2.Observability.AccessLog.Format = "json"
+	cfg2.Observability.AccessLog.Output = bad
+	if _, err := NewLoggerFromConfig(cfg2, false, false); err == nil {
+		t.Error("NewLoggerFromConfig must fail for an unwritable output path")
 	}
 }

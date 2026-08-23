@@ -49,18 +49,18 @@ func matchName(t *testing.T, rt *Router, r *http.Request) string {
 
 func TestRouterPrecedenceTable(t *testing.T) {
 	routes := []config.Route{
-		{Name: "catchall", Upstreams: "u"},                                              // 0
-		{Name: "wildcard-host", Hosts: []string{"*.example.com"}, PathPrefix: "/p"},      // 1
-		{Name: "exact-host", Hosts: []string{"api.example.com"}, PathPrefix: "/p"},       // 2
-		{Name: "short-prefix", PathPrefix: "/api"},                                       // 3
-		{Name: "param", PathPattern: "/api/{x}"},                                         // 4
-		{Name: "deep-pattern", PathPattern: "/api/users/{id}"},                           // 5
-		{Name: "any-method", PathPrefix: "/m"},                                           // 6
-		{Name: "delete-only", PathPrefix: "/m", Methods: []string{"DELETE"}},             // 7
-		{Name: "hdr-free", PathPrefix: "/h"},                                             // 8
+		{Name: "catchall", Upstreams: "u"},                                                              // 0
+		{Name: "wildcard-host", Hosts: []string{"*.example.com"}, PathPrefix: "/p"},                     // 1
+		{Name: "exact-host", Hosts: []string{"api.example.com"}, PathPrefix: "/p"},                      // 2
+		{Name: "short-prefix", PathPrefix: "/api"},                                                      // 3
+		{Name: "param", PathPattern: "/api/{x}"},                                                        // 4
+		{Name: "deep-pattern", PathPattern: "/api/users/{id}"},                                          // 5
+		{Name: "any-method", PathPrefix: "/m"},                                                          // 6
+		{Name: "delete-only", PathPrefix: "/m", Methods: []string{"DELETE"}},                            // 7
+		{Name: "hdr-free", PathPrefix: "/h"},                                                            // 8
 		{Name: "hdr-one", PathPrefix: "/h", MatchHeaders: []config.HeaderPredicate{{Name: "X-Tenant"}}}, // 9
-		{Name: "dup-a", PathPrefix: "/tie"},                                              // 10
-		{Name: "dup-b", PathPrefix: "/tie"},                                              // 11
+		{Name: "dup-a", PathPrefix: "/tie"},                                                             // 10
+		{Name: "dup-b", PathPrefix: "/tie"},                                                             // 11
 	}
 	rt := mustRouter(t, routes...)
 
@@ -167,9 +167,9 @@ func TestRouterPrefixSegmentAlignment(t *testing.T) {
 		match bool
 	}{
 		{"/v1", true},
-		{"/v1/", true},      // cleaned to /v1
+		{"/v1/", true}, // cleaned to /v1
 		{"/v1/a/b", true},
-		{"/v1x", false},     // segment alignment: never prefix-of-longer-token
+		{"/v1x", false}, // segment alignment: never prefix-of-longer-token
 		{"/v10/deep", false},
 		{"/v", false},
 	}
@@ -195,31 +195,40 @@ func TestRouterPathTraversalCleaning(t *testing.T) {
 	)
 	cases := []struct {
 		rawPath string
-		want    string // "" => expect RT001
+		want    string // route name, "" => expect RT001, or an error code
 	}{
-		{"/v1/../etc/passwd", "etc"},     // traversal resolves before matching
+		{"/v1/../etc/passwd", "etc"}, // traversal resolves before matching
 		{"/etc/../v1/x", "v1"},
-		{"//double//slash", "double"},    // collapsed
+		{"//double//slash", "double"}, // collapsed
 		{"/double/slash/../slash/./x", "double"},
-		{"/v1/%2e%2e/etc", "v1"},         // escaped dots are NOT decoded: stays under /v1
-		{"/v1/a%2Fb", "v1"},              // encoded separator never splits segments
+		{"/v1/%2e%2e/etc", errs.CodeInvalidPath}, // decoded dots are a traversal: reject
+		{"/v1/%2E%2e/admin", errs.CodeInvalidPath},
+		{"/v1/x/%2e.", errs.CodeInvalidPath},
+		{"/v1/a%2Fb", "v1"}, // encoded separator never splits segments nor triggers rejection
 		{"/etc", "etc"},
 		{"/nope", ""},
 	}
 	for _, tc := range cases {
 		rm, apiErr := rt.Match(req(t, "GET", "", tc.rawPath, nil))
-		if tc.want == "" {
+		switch {
+		case tc.want == "":
 			if apiErr == nil || apiErr.Code != errs.CodeNoRoute {
 				t.Errorf("%q: want RT001, got rm=%v err=%v", tc.rawPath, rm, apiErr)
 			}
-			continue
-		}
-		if apiErr != nil {
-			t.Errorf("%q: unexpected %v", tc.rawPath, apiErr)
-			continue
-		}
-		if rm.Route.Name != tc.want {
-			t.Errorf("%q: matched %q, want %q", tc.rawPath, rm.Route.Name, tc.want)
+		case tc.want == errs.CodeInvalidPath:
+			if apiErr == nil || apiErr.Code != errs.CodeInvalidPath {
+				t.Errorf("%q: want RT003, got rm=%v err=%v", tc.rawPath, rm, apiErr)
+			} else if status := errs.HTTPStatus(apiErr.Code); status != http.StatusBadRequest {
+				t.Errorf("%q: RT003 HTTP status = %d, want 400", tc.rawPath, status)
+			}
+		default:
+			if apiErr != nil {
+				t.Errorf("%q: unexpected %v", tc.rawPath, apiErr)
+				continue
+			}
+			if rm.Route.Name != tc.want {
+				t.Errorf("%q: matched %q, want %q", tc.rawPath, rm.Route.Name, tc.want)
+			}
 		}
 	}
 }
@@ -316,12 +325,12 @@ func TestNewRouterRejectsInvalidConfig(t *testing.T) {
 
 func TestCleanRequestPath(t *testing.T) {
 	cases := map[string]string{
-		"":                "/",
-		"/":               "/",
-		"/a/../b":         "/b",
-		"//a//b//":        "/a/b",
-		"/v1/%2e%2e/etc":  "/v1/%2e%2e/etc", // escaped form is never decoded
-		"/a/../../..":     "/",
+		"":               "/",
+		"/":              "/",
+		"/a/../b":        "/b",
+		"//a//b//":       "/a/b",
+		"/v1/%2e%2e/etc": "/v1/%2e%2e/etc", // escaped form is never decoded
+		"/a/../../..":    "/",
 	}
 	for in, want := range cases {
 		if got := cleanRequestPath(in); got != want {

@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -11,14 +12,17 @@ import (
 	"time"
 
 	"gatewright/internal/limiter"
+	"gatewright/internal/obs"
 )
 
-// Access-log field vocabulary (DESIGN.md §4 — names are fixed).
-var KnownLogFields = []string{
-	"ts", "req_id", "method", "path", "query", "route", "upstream",
-	"upstream_addr", "status", "bytes_in", "bytes_out", "duration_ms",
-	"remote", "code", "limiter_name", "limiter_outcome",
-}
+// Access-log field vocabulary: aliased to the observability package's fixed
+// list so validation and logging can never drift apart (DESIGN.md §4).
+var KnownLogFields = obs.AccessLogFields
+
+// nameRe restricts route and limiter names to bucket-safe characters:
+// names become bbolt bucket keys for shared backends, where arbitrary bytes
+// could collide or corrupt bucket identity.
+var nameRe = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 
 // normalizeAndValidate applies every documented default, then runs semantic
 // validation. Defaults are applied BEFORE validation so validation sees the
@@ -69,12 +73,8 @@ func (c *Config) normalizeAndValidate() *ValidationError {
 		}
 		if !contains(TLSVersions, c.Server.TLS.MinVersion) {
 			fail("server.tls.min_version", strconv.Quote(c.Server.TLS.MinVersion),
-				"one of: "+enumList(TLSVersions), "")
-		}
-		if c.Server.TLS.MinVersion == "tls10" || c.Server.TLS.MinVersion == "tls11" {
-			add(&Error{Path: "server.tls.min_version", Found: c.Server.TLS.MinVersion,
-				Expected: "tls12 or tls13", Code: CodeUnsafeCombination,
-				Hint: "TLS < 1.2 is deprecated; startup will log a loud warning"})
+				"one of: "+enumList(TLSVersions),
+				"TLS below 1.2 is not accepted; migrate clients to tls12 or tls13")
 		}
 	}
 
@@ -207,6 +207,11 @@ func (c *Config) normalizeAndValidate() *ValidationError {
 		if !require(r.Name != "", base+".name") {
 			continue
 		}
+		if !nameRe.MatchString(r.Name) {
+			fail(base+".name", strconv.Quote(r.Name),
+				"1-64 characters from A-Za-z0-9_-",
+				"names become storage bucket keys; unrestricted bytes could collide or alias buckets")
+		}
 		if routeNames[r.Name] {
 			add(&Error{Path: base + ".name", Found: strconv.Quote(r.Name),
 				Expected: "a unique route name", Code: CodeDuplicateName})
@@ -266,7 +271,8 @@ func (c *Config) normalizeAndValidate() *ValidationError {
 				add(&Error{Path: mp + ".upstreams", Found: strconv.Quote(r.Mirror.Upstreams),
 					Expected: "a pool defined under upstreams:", Code: CodeSemanticConflict})
 			}
-			if r.Mirror.Percentage <= 0 || r.Mirror.Percentage > 100 {
+			if math.IsNaN(r.Mirror.Percentage) || math.IsInf(r.Mirror.Percentage, 0) ||
+				r.Mirror.Percentage <= 0 || r.Mirror.Percentage > 100 {
 				fail(mp+".percentage", strconv.FormatFloat(r.Mirror.Percentage, 'f', -1, 64),
 					"> 0 and <= 100", "")
 			}
@@ -307,7 +313,7 @@ func (c *Config) normalizeAndValidate() *ValidationError {
 					add(&Error{Path: ap + ".api_key", Expected: "api_key block when type is api_key",
 						Code: CodeMissingRequired})
 				} else {
-					require(k.Header != "", ap + ".api_key.header")
+					require(k.Header != "", ap+".api_key.header")
 					if (k.KeysEnv == "") == (k.KeysFile == "") {
 						add(&Error{Path: ap + ".api_key",
 							Expected: "exactly one of keys_env or keys_file", Code: CodeSemanticConflict})
@@ -349,8 +355,11 @@ func (c *Config) normalizeAndValidate() *ValidationError {
 						add(&Error{Path: ap + ".jwt",
 							Expected: "secret_env when HS* algorithms are listed", Code: CodeSemanticConflict})
 					}
-					if jw := j.JwksURL; jw != "" && !strings.HasPrefix(jw, "http") {
-						fail(ap+".jwt.jwks_url", strconv.Quote(jw), "an http(s) URL", "")
+					if jw := j.JwksURL; jw != "" {
+						u, perr := url.Parse(jw)
+						if perr != nil || (u.Scheme != "http" && u.Scheme != "https") {
+							fail(ap+".jwt.jwks_url", strconv.Quote(jw), "an absolute http:// or https:// URL", "")
+						}
 					}
 				}
 			}
@@ -361,6 +370,11 @@ func (c *Config) normalizeAndValidate() *ValidationError {
 			rl := &r.RateLimits[li]
 			lp := fmt.Sprintf("%s.rate_limits[%d]", base, li)
 			require(rl.Name != "", lp+".name")
+			if rl.Name != "" && !nameRe.MatchString(rl.Name) {
+				fail(lp+".name", strconv.Quote(rl.Name),
+					"1-64 characters from A-Za-z0-9_-",
+					"names become storage bucket keys; unrestricted bytes could collide or alias buckets")
+			}
 			if rl.Name != "" && rlNames[rl.Name] {
 				add(&Error{Path: lp + ".name", Found: strconv.Quote(rl.Name),
 					Expected: "a unique limiter name within the route", Code: CodeDuplicateName})
@@ -527,14 +541,20 @@ func (c *Config) applyDefaults() {
 }
 
 func validateHeaderManip(errs *[]*Error, base string, m *HeaderManip) {
-	for k := range m.Set {
+	for k, v := range m.Set {
 		if !validHeaderName(k) {
 			failOn(errs, base+".set", strconv.Quote(k), "a valid header field-name")
+		} else if !validHeaderValue(v) {
+			failOn(errs, base+".set."+k, strconv.Quote(v),
+				"printable ASCII (0x20-0x7E) or tab, with no CR/LF/NUL")
 		}
 	}
-	for k := range m.Add {
+	for k, v := range m.Add {
 		if !validHeaderName(k) {
 			failOn(errs, base+".add", strconv.Quote(k), "a valid header field-name")
+		} else if !validHeaderValue(v) {
+			failOn(errs, base+".add."+k, strconv.Quote(v),
+				"printable ASCII (0x20-0x7E) or tab, with no CR/LF/NUL")
 		}
 	}
 	for i, k := range m.Del {
@@ -542,6 +562,20 @@ func validateHeaderManip(errs *[]*Error, base string, m *HeaderManip) {
 			failOn(errs, fmt.Sprintf("%s.del[%d]", base, i), strconv.Quote(k), "a valid header field-name")
 		}
 	}
+}
+
+// validHeaderValue rejects anything outside printable ASCII plus tab so a
+// crafted value can never smuggle CR/LF/NUL into an emitted header.
+func validHeaderValue(v string) bool {
+	for _, r := range v {
+		if r == '\t' {
+			continue
+		}
+		if r < 0x20 || r > 0x7E {
+			return false
+		}
+	}
+	return true
 }
 
 func failOn(errs *[]*Error, path, found, expected string) {

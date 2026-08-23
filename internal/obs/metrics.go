@@ -13,9 +13,9 @@ import (
 //
 //	gatewright_<noun>_<unit>; counters end _total; histograms end _seconds.
 type Metrics struct {
-	mu        sync.Mutex
-	counters  map[string]*counterFamily
-	gauges    map[string]*gaugeFamily
+	mu         sync.Mutex
+	counters   map[string]*counterFamily
+	gauges     map[string]*gaugeFamily
 	histograms map[string]*histogramFamily
 }
 
@@ -80,9 +80,8 @@ type histogramFamily struct {
 }
 
 type histSeries struct {
-	counts []uint64 // per bucket cumulative counts are computed at render
-	sum    float64
-	count  uint64
+	sum          float64
+	count        uint64
 	bucketCounts []uint64
 }
 

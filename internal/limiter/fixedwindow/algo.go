@@ -28,8 +28,8 @@ type state struct {
 }
 
 const (
-	stateVersion = 1           // first byte of every encoded state
-	stateSize    = 1 + 8 + 8   // version + windowStart + count
+	stateVersion = 1         // first byte of every encoded state
+	stateSize    = 1 + 8 + 8 // version + windowStart + count
 )
 
 // algo implements limiter.Strategy for fixed_window.

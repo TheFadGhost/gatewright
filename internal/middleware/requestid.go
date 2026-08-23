@@ -30,6 +30,13 @@ func RequestIDFrom(ctx context.Context) string {
 	return id
 }
 
+// FromContext returns the request id installed by WithRequestID/NewRequestID,
+// or "" when unset. Exported so other packages (the proxy error writer)
+// can read the correlation id without touching the header.
+func FromContext(ctx context.Context) string {
+	return RequestIDFrom(ctx)
+}
+
 // ValidRequestID reports whether s is an acceptable inbound id: 1..64
 // printable ASCII bytes, no spaces or control characters, so it survives
 // headers, log lines and grep unchanged.

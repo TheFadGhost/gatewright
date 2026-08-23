@@ -270,9 +270,7 @@ func (s *Supervisor) LimiterViews() []admin.LimiterView {
 	for _, key := range s.sink.sortedKeys() {
 		allowed, limited, evictions, _ := s.sink.perSec(key)
 		var route, name, strategy string
-		_, _ = fmt.Sscanf(key, "%s", &route)
-		parts := splitKey(key)
-		if len(parts) == 3 {
+		if parts := splitKey(key); len(parts) == 3 {
 			route, name, strategy = parts[0], parts[1], parts[2]
 		}
 		out = append(out, admin.LimiterView{

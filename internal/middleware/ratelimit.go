@@ -144,12 +144,11 @@ func NewRateLimit(entries []RateLimitEntry, sink *obs.Metrics) Middleware {
 			start := time.Now()
 			id, _ := IdentityFrom(r.Context())
 			var (
-				most      limiter.Decision
-				mostName  string
-				have      bool
-				denied    *RateLimitEntry
-				deniedKey string
-				pending   []pendingRelease
+				most     limiter.Decision
+				mostName string
+				have     bool
+				denied   *RateLimitEntry
+				pending  []pendingRelease
 			)
 			for i := range entries {
 				e := &entries[i]
@@ -166,7 +165,7 @@ func NewRateLimit(entries []RateLimitEntry, sink *obs.Metrics) Middleware {
 					most, mostName, have = d, e.Name, true
 				}
 				if !d.Allowed {
-					denied, deniedKey = e, key
+					denied = e
 					break // first denial short-circuits remaining limiters
 				}
 			}
@@ -191,9 +190,13 @@ func NewRateLimit(entries []RateLimitEntry, sink *obs.Metrics) Middleware {
 				h := w.Header()
 				setRateHeaders(h, most)
 				h.Set("Retry-After", strconv.FormatInt(retryAfterSeconds(most.RetryAfter), 10))
+				// The bucket key can carry secrets (api keys, tenant ids): it
+				// is never echoed to the client, only named by limiter. No
+				// debug logger exists on this stage today, so the key is
+				// omitted entirely rather than logged.
 				errs.WriteWithID(w,
 					errs.New(errs.CodeRateLimited,
-						fmt.Sprintf("quota exceeded for key %q (%s)", deniedKey, denied.Name)),
+						fmt.Sprintf("quota exceeded (limiter %s)", denied.Name)),
 					RequestIDFrom(r.Context()))
 				RecordStage(r.Context(), OrderNames[PosRateLimit], time.Since(start))
 				return

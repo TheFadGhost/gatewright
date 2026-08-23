@@ -2,6 +2,7 @@ package store
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"fmt"
 	"path/filepath"
@@ -315,5 +316,112 @@ func TestConcurrentDistinctKeysScale(t *testing.T) {
 		if err != nil {
 			t.Fatalf("verify %s: %v", key, err)
 		}
+	}
+}
+
+// sweepWait polls cond until true or the deadline expires (sweeper timing).
+func sweepWait(t *testing.T, d time.Duration, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("timed out after %s waiting for %s", d, what)
+}
+
+// rawKeys lists every key physically present in a bucket, bypassing Update's
+// lazy expiry handling — exactly what the sweeper must act on.
+func rawKeys(t *testing.T, d *DB, bucket string) []string {
+	t.Helper()
+	var out []string
+	if err := d.db.View(func(tx *bbolt.Tx) error {
+		bt := tx.Bucket([]byte(bucket))
+		if bt == nil {
+			return nil
+		}
+		return bt.ForEach(func(k, _ []byte) error {
+			out = append(out, string(k))
+			return nil
+		})
+	}); err != nil {
+		t.Fatalf("view %s: %v", bucket, err)
+	}
+	return out
+}
+
+func containsStr(list []string, s string) bool {
+	for _, x := range list {
+		if x == s {
+			return true
+		}
+	}
+	return false
+}
+
+// TestSweeperDeletesExpiredAcrossBuckets seeds live and expired entries in
+// two buckets, runs the sweeper at a tiny interval, and polls until ONLY the
+// expired keys are physically gone from both buckets while the live one stays.
+func TestSweeperDeletesExpiredAcrossBuckets(t *testing.T) {
+	d := openTestDB(t)
+
+	put := func(bucket, key string, ttl time.Duration) {
+		t.Helper()
+		if err := d.Update(key, ttl, bucket, func([]byte, bool) []byte {
+			return []byte("v")
+		}); err != nil {
+			t.Fatalf("seed %s/%s: %v", bucket, key, err)
+		}
+	}
+	put("bktA", "live-a", time.Hour)
+	put("bktA", "dead-a", 15*time.Millisecond)
+	put("bktB", "dead-b", 15*time.Millisecond)
+
+	d.StartSweeper(context.Background(), 2*time.Millisecond)
+
+	sweepWait(t, 5*time.Second, "sweeper to purge expired entries in both buckets", func() bool {
+		a := rawKeys(t, d, "bktA")
+		b := rawKeys(t, d, "bktB")
+		return !containsStr(a, "dead-a") && !containsStr(b, "dead-b") &&
+			containsStr(a, "live-a") && len(a) == 1 && len(b) == 0
+	})
+
+	a := rawKeys(t, d, "bktA")
+	if !containsStr(a, "live-a") {
+		t.Errorf("live entry swept too: bktA = %v", a)
+	}
+}
+
+// TestSweeperStopsOnCloseAndContext proves both shutdown paths release the
+// goroutine: Close stops it (and releases the file lock), and cancelling the
+// context ends sweeping without touching the file.
+func TestSweeperStopsOnCloseAndContext(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sweep.bolt")
+	d, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	d.StartSweeper(ctx, time.Millisecond)
+	cancel() // sweeper must wind down; nothing observable except no panic
+	if err := d.Close(); err != nil {
+		t.Fatalf("Close after ctx cancel: %v", err)
+	}
+
+	d2, err := Open(path) // lock must be free: proves the handle closed cleanly
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	d2.StartSweeper(context.Background(), time.Millisecond)
+	if err := d2.Close(); err != nil {
+		t.Fatalf("Close with active sweeper: %v", err)
+	}
+	// Handle is closed for business: updates fail loudly rather than hang.
+	err = d2.Update("k", time.Hour, "b", func([]byte, bool) []byte { return nil })
+	if err == nil {
+		t.Error("Update after Close succeeded; expected closed-database error")
 	}
 }

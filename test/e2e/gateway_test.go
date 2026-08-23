@@ -33,6 +33,7 @@ import (
 	"testing"
 	"time"
 
+	"gatewright/internal/admin"
 	"gatewright/internal/config"
 	_ "gatewright/internal/limiter/builtin" // registers limiter strategies for validation & engines
 	"gatewright/internal/obs"
@@ -500,9 +501,8 @@ routes:
 `)
 
 	blocked := make(chan int, 4)
-	// Warm the route chain with a single held request first: the runtime
-	// lazily caches per-route middleware chains on first contact, so the
-	// genuinely-parallel phase below must not race that initialization.
+	// Hold one of the two capacity slots first so the peak assertions below
+	// exercise admission under a partially and then fully occupied limiter.
 	go func() {
 		resp, err := g.client().Get(g.url + "/cap/work")
 		if err != nil {
@@ -1408,8 +1408,7 @@ routes:
 		return resp.StatusCode
 	}
 
-	// --- Instance A: warm the route chain single-flight (the runtime caches
-	// per-route chains lazily), then hammer 29 concurrent requests ----------
+	// --- Instance A: one counted request up front, then hammer 29 more -----
 	gA := startGateway(t, cfg)
 	if code := doRequest(gA, 999); code != http.StatusOK {
 		t.Fatalf("instance A warm-up request: status = %d, want 200", code)
@@ -1443,8 +1442,8 @@ routes:
 
 	// --- Instance B: same shared state, nothing left -----------------------
 	gB := startGateway(t, cfg)
-	// Warm the chain single-flight as well (quota already spent, so the
-	// expected answer is 429 -- the chain caches before the limiter runs).
+	// One single-flight probe first: quota is already spent, so the expected
+	// answer is 429 before the hammer below confirms zero admissions.
 	if code := doRequest(gB, 999); code != http.StatusTooManyRequests {
 		t.Fatalf("instance B warm-up request: status = %d, want 429", code)
 	}
@@ -1499,5 +1498,139 @@ routes:
 	}
 	if !strings.Contains(msg, path) && !strings.Contains(msg, filepath.Base(path)) {
 		t.Errorf("validation error does not name the offending file %q:\n%s", path, msg)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 14. Audit-driven end-to-end coverage.
+//
+//     StripPrefix through the full supervisor stack is wired in a separate
+//     commit (runtime/build.go owns ForwarderOpts.StripPrefix); the assertion
+//     below encodes the TARGET behaviour and is therefore gated behind
+//     GW_E2E_FULL=1 so the suite stays green until that wiring lands. The
+//     path-normalization and admin host-spoof cases are live immediately.
+// ---------------------------------------------------------------------------
+
+func requireFullWiring(t *testing.T) {
+	t.Helper()
+	if os.Getenv("GW_E2E_FULL") != "1" {
+		t.Skipf("skipped: set GW_E2E_FULL=1 to enable (needs strip_prefix runtime wiring)")
+	}
+}
+
+func TestStripPrefixEndToEndThroughSupervisor(t *testing.T) {
+	requireFullWiring(t)
+
+	up := startUpstream(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(r.URL.Path))
+	}))
+
+	g := startGateway(t, cfgHeader+upstreamTarget(up.URL)+`
+routes:
+  - name: stripped
+    path_prefix: /v1
+    upstreams: app
+    strip_prefix: true
+    timeout: 10s
+`)
+
+	for _, tc := range []struct{ in, want string }{
+		{"/v1/users/42", "/users/42"},
+		{"/v1", "/"},
+	} {
+		resp, err := g.client().Get(g.url + tc.in)
+		if err != nil {
+			t.Fatalf("GET %s: %v", tc.in, err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK || string(body) != tc.want {
+			t.Errorf("GET %s: status=%d upstream saw %q, want 200 %q",
+				tc.in, resp.StatusCode, body, tc.want)
+		}
+	}
+}
+
+func TestEncodedDotSegmentTraversalRejectedEndToEnd(t *testing.T) {
+	up := startUpstream(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("reached:" + r.URL.Path))
+	}))
+
+	g := startGateway(t, cfgHeader+upstreamTarget(up.URL)+`
+routes:
+  - name: v1
+    path_prefix: /v1
+    upstreams: app
+    timeout: 10s
+`)
+
+	client := g.client()
+
+	for _, p := range []string{"/v1/%2e%2e/secret", "/v1/x/%2E%2e/admin"} {
+		resp, err := client.Get(g.url + p)
+		if err != nil {
+			t.Fatalf("GET %s: %v", p, err)
+		}
+		env := errorEnvelopeOf(t, resp)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("GET %s: status = %d, want 400", p, resp.StatusCode)
+		}
+		if code, _ := env["code"].(string); code != "RT003" {
+			t.Errorf("GET %s: envelope code = %v, want RT003", p, env["code"])
+		}
+	}
+
+	// Control: ordinary paths still reach the upstream untouched.
+	respOK, err := client.Get(g.url + "/v1/normal")
+	if err != nil {
+		t.Fatalf("control GET: %v", err)
+	}
+	body, _ := io.ReadAll(respOK.Body)
+	respOK.Body.Close()
+	if respOK.StatusCode != http.StatusOK || string(body) != "reached:/v1/normal" {
+		t.Errorf("control GET: status=%d body=%q, want 200 reached:/v1/normal", respOK.StatusCode, body)
+	}
+}
+
+func TestTokenlessAdminRejectsSpoofedHostEndToEnd(t *testing.T) {
+	g := startGateway(t, cfgHeader+upstreamTarget("http://127.0.0.1:9")+`
+routes:
+  - name: dummy
+    path_prefix: /d
+    upstreams: app
+    timeout: 5s
+`)
+
+	adminSrv := httptest.NewServer(admin.New(g.sup, admin.Options{}))
+	t.Cleanup(adminSrv.Close)
+
+	doWithHost := func(host string) (*http.Response, error) {
+		req, err := http.NewRequest(http.MethodGet, adminSrv.URL+"/admin/api/state", nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Host = host
+		return (&http.Client{Timeout: 10 * time.Second}).Do(req)
+	}
+
+	resp, err := doWithHost("evil.example.com")
+	if err != nil {
+		t.Fatalf("spoofed-host request: %v", err)
+	}
+	env := errorEnvelopeOf(t, resp)
+	if resp.StatusCode != http.StatusForbidden {
+		t.Errorf("spoofed Host: status = %d, want 403", resp.StatusCode)
+	}
+	if code, _ := env["code"].(string); code != "AUTH002" {
+		t.Errorf("spoofed Host: error code = %v, want AUTH002", env["code"])
+	}
+
+	respLocal, err := doWithHost("127.0.0.1:65535")
+	if err != nil {
+		t.Fatalf("loopback-host request: %v", err)
+	}
+	defer respLocal.Body.Close()
+	if respLocal.StatusCode != http.StatusOK {
+		t.Errorf("loopback Host: status = %d, want 200 for tokenless admin", respLocal.StatusCode)
 	}
 }

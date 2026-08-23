@@ -43,16 +43,10 @@ func readLines(t *testing.T, path string) []string {
 }
 
 // ---------------------------------------------------------------------------
-// JSON mode: exact key sets for access lines and subset filtering.
+// JSON mode: core keys always present, empty strings omitted, subset filtering.
 // ---------------------------------------------------------------------------
 
-var allAccessKeys = []string{
-	"ts", "level", "msg", "req_id", "method", "path", "query", "route",
-	"upstream", "upstream_addr", "status", "bytes_in", "bytes_out",
-	"duration_ms", "remote", "code", "limiter_name", "limiter_outcome",
-}
-
-func TestAccessJSONEmitsExactKeySetWithoutFilter(t *testing.T) {
+func TestAccessJSONEmitsCoreKeysPlusNonEmptyFields(t *testing.T) {
 	l, path := newFileLogger(t, Options{Format: "json"})
 	l.Access(AccessFields{
 		ReqID: "req-1", Method: "GET", Path: "/x", Status: 200,
@@ -65,12 +59,32 @@ func TestAccessJSONEmitsExactKeySetWithoutFilter(t *testing.T) {
 	if err := json.Unmarshal([]byte(lines[0]), &m); err != nil {
 		t.Fatalf("line not JSON: %v\n%q", err, lines[0])
 	}
-	if len(m) != len(allAccessKeys) {
-		t.Errorf("key count = %d, want %d; keys = %v", len(m), len(allAccessKeys), keys(m))
+	// ts/level/msg are never filtered; zero-value strings (query, route, code,
+	// ...) are omitted; numeric fields stay even when zero.
+	want := map[string]any{
+		"ts": m["ts"], "level": "info", "msg": "access",
+		"req_id": "req-1", "method": "GET", "path": "/x",
+		"status": float64(200), "bytes_in": float64(0),
+		"bytes_out": float64(0), "duration_ms": float64(0),
 	}
-	for _, k := range allAccessKeys {
-		if _, ok := m[k]; !ok {
+	if len(m) != len(want) {
+		t.Errorf("key count = %d, want %d; keys = %v", len(m), len(want), keys(m))
+	}
+	for k, v := range want {
+		got, ok := m[k]
+		if !ok {
 			t.Errorf("missing access-log key %q", k)
+			continue
+		}
+		switch v.(type) {
+		case string:
+			if got != v && k != "ts" {
+				t.Errorf("%s = %v, want %v", k, got, v)
+			}
+		default:
+			if got != v {
+				t.Errorf("%s = %v, want %v", k, got, v)
+			}
 		}
 	}
 }
@@ -92,13 +106,32 @@ func TestAccessJSONFieldSubsetFiltersExactly(t *testing.T) {
 	if err := json.Unmarshal([]byte(lines[0]), &m); err != nil {
 		t.Fatalf("line not JSON: %v", err)
 	}
-	want := map[string]any{"req_id": "req-7", "status": float64(201)}
+	// The core envelope (ts/level/msg) survives every filter; only the two
+	// selected fields join it.
+	want := map[string]any{"ts": m["ts"], "level": "info", "msg": "access",
+		"req_id": "req-7", "status": float64(201)}
 	if len(m) != len(want) {
 		t.Errorf("keys = %v, want exactly %v", keys(m), keys(want))
 	}
 	for k, v := range want {
 		if m[k] != v {
 			t.Errorf("%s = %v, want %v", k, m[k], v)
+		}
+	}
+}
+
+func TestAccessLogFieldVocabularySharedAndComplete(t *testing.T) {
+	if len(AccessLogFields) != 16 {
+		t.Errorf("AccessLogFields has %d entries, want the fixed 16", len(AccessLogFields))
+	}
+	for _, f := range AccessLogFields {
+		if !ValidAccessLogField(f) {
+			t.Errorf("ValidAccessLogField(%q) = false for a listed field", f)
+		}
+	}
+	for _, bogus := range []string{"", "reqid", "status_code", "TS"} {
+		if ValidAccessLogField(bogus) {
+			t.Errorf("ValidAccessLogField(%q) = true, want false", bogus)
 		}
 	}
 }
@@ -178,10 +211,43 @@ func TestHumanAccessSingleLineFormat(t *testing.T) {
 		Route: "rt", Upstream: "api", Status: 201,
 		DurationMS: 1.3, BytesOut: 42, Remote: "10.0.0.1",
 	})
-	want := humanTS + " INF req_id=r-1 POST /p?q=1 route=rt upstream=api" +
-		" status=201 dur=1.3ms out=42B remote=10.0.0.1\n"
+	want := humanTS + " INF req_id=r-1 status=201 duration_ms=1.3ms" +
+		" bytes_in=0 bytes_out=42 method=POST path=/p?q=1 remote=10.0.0.1" +
+		" route=rt upstream=api\n"
 	if got := buf.String(); got != want {
 		t.Fatalf("human access line:\n got %q\nwant %q", got, want)
+	}
+}
+
+func TestHumanAccessHonoursFieldSubsetAndCoreFour(t *testing.T) {
+	buf := &bytes.Buffer{}
+	l := &stdLogger{w: buf, fields: map[string]bool{"route": true}}
+	l.Access(AccessFields{
+		TS: humanTS, ReqID: "r-9", Method: "GET", Path: "/sub",
+		Route: "only-this", Status: 200, DurationMS: 2,
+	})
+	want := humanTS + " INF req_id=r-9 status=200 duration_ms=2.0ms route=only-this\n"
+	if got := buf.String(); got != want {
+		t.Fatalf("subset line:\n got %q\nwant %q", got, want)
+	}
+}
+
+func TestHumanAccessOmitsEmptyStrings(t *testing.T) {
+	buf := &bytes.Buffer{}
+	l := &stdLogger{w: buf}
+	l.Access(AccessFields{TS: humanTS, Status: 204})
+	out := buf.String()
+	// Optional empty-string fields vanish entirely...
+	for _, banned := range []string{"route=", "code=", "method=", "path="} {
+		if strings.Contains(out, banned) {
+			t.Errorf("empty optional field rendered: %q in %q", banned, out)
+		}
+	}
+	// ...while the core four are always present (req_id as a dash) and
+	// numeric fields stay even when zero.
+	want := humanTS + " INF req_id=- status=204 duration_ms=0.0ms bytes_in=0 bytes_out=0\n"
+	if out != want {
+		t.Fatalf("line:\n got %q\nwant %q", out, want)
 	}
 }
 
@@ -190,7 +256,7 @@ func TestHumanAccessColourByStatusClass(t *testing.T) {
 		status int
 		prefix string
 	}{
-		{200, ""},          // 2xx plain
+		{200, ""},         // 2xx plain
 		{404, "\x1b[33m"}, // 4xx yellow
 		{502, "\x1b[31m"}, // 5xx red
 	}
@@ -356,12 +422,5 @@ func TestInvalidOutputPathReturnsError(t *testing.T) {
 		t.Fatal("New must fail for an unwritable output path")
 	} else if !strings.Contains(err.Error(), "cannot open log output") {
 		t.Errorf("error = %v, want unwritable-output detail", err)
-	}
-}
-
-func TestNextSeqMonotonic(t *testing.T) {
-	a, b := NextSeq(), NextSeq()
-	if b <= a {
-		t.Errorf("NextSeq not monotonic: %d then %d", a, b)
 	}
 }

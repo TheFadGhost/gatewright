@@ -4,7 +4,6 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"gatewright/internal/limiter"
 )
@@ -25,12 +24,13 @@ type limAgg struct {
 	allowed               atomic.Uint64
 	limited               atomic.Uint64
 	evictions             atomic.Uint64
+	storeErrors           atomic.Uint64
 }
 
 type limSample struct {
-	seq      uint64
-	allowed  uint64
-	limited  uint64
+	seq     uint64
+	allowed uint64
+	limited uint64
 }
 
 func newSinkAgg(inner limiter.MetricsSink) *sinkAgg {
@@ -79,6 +79,33 @@ func (a *sinkAgg) ObserveEviction(route, name, strategy string) {
 	}
 }
 
+// ObserveStoreError implements limiter.StoreErrorSink: shared-store failures
+// are counted per limiter and forwarded to an inner sink that also extends
+// the optional interface.
+func (a *sinkAgg) ObserveStoreError(route, name, strategy string) {
+	key := aggKey(route, name, strategy)
+	a.mu.Lock()
+	g, ok := a.aggs[key]
+	if !ok {
+		g = &limAgg{route: route, name: name, strategy: strategy}
+		a.aggs[key] = g
+	}
+	a.mu.Unlock()
+	g.storeErrors.Add(1)
+	if inner, ok := a.inner.(limiter.StoreErrorSink); ok && a.inner != nil {
+		inner.ObserveStoreError(route, name, strategy)
+	}
+}
+
+func (a *sinkAgg) storeErrorsFor(key string) uint64 {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if g := a.aggs[key]; g != nil {
+		return g.storeErrors.Load()
+	}
+	return 0
+}
+
 // tick snapshots cumulative counters into per-second rings for rate math.
 func (a *sinkAgg) tick() {
 	a.mu.Lock()
@@ -108,14 +135,13 @@ func (a *sinkAgg) perSec(key string) (allowed, limited float64, evictions uint64
 	if len(ring) < 2 {
 		return 0, 0, evictions, true
 	}
-	n := time.Duration(len(ring) - 1)
 	newest, oldest := ring[len(ring)-1], ring[0]
-	seconds := n.Seconds()
-	if seconds <= 0 {
-		seconds = 1
+	n := len(ring) - 1 // samples are one second apart (tick cadence)
+	if n <= 0 {
+		n = 1
 	}
-	return float64(newest.allowed-oldest.allowed) / seconds,
-		float64(newest.limited-oldest.limited) / seconds,
+	return float64(newest.allowed-oldest.allowed) / float64(n),
+		float64(newest.limited-oldest.limited) / float64(n),
 		evictions, true
 }
 

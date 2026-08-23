@@ -113,7 +113,7 @@ func addTarget(cfg *Config, url string, weight int) {
 	cfg.Targets = append(cfg.Targets, TargetConfig{URL: url, Weight: weight})
 }
 
-func okOutcome() Outcome  { return Outcome{Success: true, Status: 200, Latency: 2 * time.Millisecond} }
+func okOutcome() Outcome { return Outcome{Success: true, Status: 200, Latency: 2 * time.Millisecond} }
 func failOutcome() Outcome {
 	return Outcome{Success: false, ErrClass: ErrConnect, Latency: time.Millisecond}
 }
@@ -1192,5 +1192,145 @@ func TestConcurrencyHammerWithEjections(t *testing.T) {
 	wg.Wait()
 	if sum := inflightSum(t, p); sum != 0 {
 		t.Fatalf("inflight leak under ejection churn: %d", sum)
+	}
+}
+
+// --- audit fixes ------------------------------------------------------------
+
+// TestRingHashDistinctKeysRouteToDistinctTargets proves the ring actually
+// separates keys: for a two-target pool, two keys are located that map to
+// different targets, and each keeps landing on its own target across many
+// picks (the forwarder relies on exactly this contract when hash_key is set).
+func TestRingHashDistinctKeysRouteToDistinctTargets(t *testing.T) {
+	cfg := baseCfg("ring_hash")
+	addTarget(&cfg, "http://a:1", 1)
+	addTarget(&cfg, "http://b:1", 1)
+	p := New(cfg)
+
+	pick := func(key string) string {
+		tgt, err := p.Pick(key)
+		if err != nil {
+			t.Fatalf("Pick(%q): %v", key, err)
+		}
+		p.Done(tgt, okOutcome())
+		return tgt.Name
+	}
+	keyA, keyB := "", ""
+	for i := 0; i < 512 && keyA == ""; i++ {
+		a := fmt.Sprintf("k%d", i)
+		ta := pick(a)
+		for j := i + 1; j < 512; j++ {
+			b := fmt.Sprintf("k%d", j)
+			if tb := pick(b); tb != ta {
+				keyA, keyB = a, b
+				break
+			}
+		}
+	}
+	if keyA == "" {
+		t.Fatal("no two distinct keys found on a two-target ring; hashing is degenerate")
+	}
+
+	wantA, wantB := pick(keyA), pick(keyB)
+	if wantA == wantB {
+		t.Fatalf("keys %q/%q converged on %s", keyA, keyB, wantA)
+	}
+	for i := 0; i < 50; i++ {
+		if got := pick(keyA); got != wantA {
+			t.Fatalf("key %q moved from %s to %s", keyA, wantA, got)
+		}
+		if got := pick(keyB); got != wantB {
+			t.Fatalf("key %q moved from %s to %s", keyB, wantB, got)
+		}
+	}
+}
+
+// TestDoneIgnoresCanceledOutcomes pins the client-cancel rule: ErrCanceled
+// outcomes leave passive-health windows, the breaker and the probing state
+// machine untouched, while the in-flight slot is still handed back.
+func TestDoneIgnoresCanceledOutcomes(t *testing.T) {
+	cfg := baseCfg("round_robin")
+	cfg.Passive = PassiveConfig{Window: time.Hour, Failures: 2, EjectionTime: time.Hour}
+	cfg.Breaker = BreakerConfig{Failures: 2, Window: time.Hour, Cooldown: time.Hour, HalfOpenProbes: 1}
+	addTarget(&cfg, "http://t0:1", 1)
+	p := New(cfg)
+
+	// Done is keyed by the registry's own *Target; always take it from Pick.
+	tgt, err := p.Pick("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.Done(tgt, okOutcome()) // clear the pick
+
+	canceled := Outcome{Success: false, ErrClass: ErrCanceled}
+	for i := 0; i < 10; i++ {
+		p.Done(tgt, canceled)
+	}
+
+	st := statusByName(t, p, "pl[0]")
+	if st.State != StateHealthy {
+		t.Errorf("state = %v, want healthy (cancels must not eject)", st.State)
+	}
+	if st.Failures != 0 {
+		t.Errorf("passive failures = %d, want 0", st.Failures)
+	}
+	if st.CircuitOpen {
+		t.Error("breaker opened on client cancels")
+	}
+	if st.TotalFail != 0 {
+		t.Errorf("TotalFail = %d, want 0 (cancel is not an upstream failure)", st.TotalFail)
+	}
+
+	// In-flight accounting survives: begin then cancel returns the slot.
+	before := statusByName(t, p, "pl[0]").Inflight
+	t2, err := p.Pick("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mid := statusByName(t, p, t2.Name).Inflight
+	p.Done(t2, canceled)
+	after := statusByName(t, p, t2.Name).Inflight
+	if mid != before+1 || after != before {
+		t.Errorf("inflight before/mid/after = %d/%d/%d, want slot returned by canceled Done", before, mid, after)
+	}
+
+	// Contrast: real failures still count once classification differs.
+	p.Done(tgt, failOutcome())
+	p.Done(tgt, failOutcome())
+	st = statusByName(t, p, "pl[0]")
+	if st.Failures != 0 || (!st.CircuitOpen && st.State == StateHealthy) {
+		t.Errorf("real failures not counted: status %+v, want ejection/breaker activity", st)
+	}
+}
+
+// TestCanceledHalfOpenProbeDoesNotWedgeBreaker proves the one exception to
+// full ignoring: a canceled half-open probe releases its budget (without any
+// success/failure consequence) so the breaker can never wedge in half-open.
+func TestCanceledHalfOpenProbeDoesNotWedgeBreaker(t *testing.T) {
+	cfg := baseCfg("round_robin")
+	cfg.Breaker = BreakerConfig{Failures: 1, Window: time.Hour, Cooldown: 20 * time.Millisecond, HalfOpenProbes: 1}
+	addTarget(&cfg, "http://t0:1", 1)
+	p := New(cfg)
+
+	tgt, err := p.Pick("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.Done(tgt, failOutcome()) // trips the breaker
+	if st := statusByName(t, p, "pl[0]"); !st.CircuitOpen {
+		t.Fatalf("breaker should be open, status %+v", st)
+	}
+
+	time.Sleep(40 * time.Millisecond) // cooldown elapses; next Pick sees half-open
+
+	probe, err := p.Pick("") // the single half-open probe slot
+	if err != nil {
+		t.Fatalf("half-open probe not admitted: %v", err)
+	}
+	p.Done(probe, Outcome{Success: false, ErrClass: ErrCanceled}) // client hung up
+
+	// The budget must be free again instead of wedged behind the dead probe.
+	if _, err := p.Pick(""); err != nil {
+		t.Fatalf("half-open budget wedged by canceled probe: %v", err)
 	}
 }

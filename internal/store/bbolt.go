@@ -12,7 +12,9 @@ package store
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
+	"sync"
 	"time"
 
 	bbolt "go.etcd.io/bbolt"
@@ -32,6 +34,10 @@ var metaBucket = []byte("meta")
 // multiple goroutines and, thanks to the file lock, across processes.
 type DB struct {
 	db *bbolt.DB
+
+	sweepOnce sync.Once
+	sweepStop chan struct{}
+	closeOnce sync.Once
 }
 
 // Compile-time proof that the production driver satisfies the audited
@@ -47,7 +53,7 @@ func Open(path string) (*DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	d := &DB{db: db}
+	d := &DB{db: db, sweepStop: make(chan struct{})}
 	if err := db.Update(func(tx *bbolt.Tx) error {
 		_, err := tx.CreateBucketIfNotExists(metaBucket)
 		return err
@@ -115,8 +121,80 @@ func (d *DB) Update(key string, ttl time.Duration, bucket string,
 	})
 }
 
-// Close releases the file lock and flushes pending writes.
-func (d *DB) Close() error { return d.db.Close() }
+// StartSweeper launches a background goroutine that periodically deletes
+// every expired entry across all buckets, one writer transaction per bucket,
+// so dead state cannot accumulate between touches of a key. Safe to call at
+// most once per DB; further calls are no-ops. A non-positive interval starts
+// nothing. Close stops the sweeper before closing the file.
+func (d *DB) StartSweeper(ctx context.Context, interval time.Duration) {
+	if interval <= 0 {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	d.sweepOnce.Do(func() {
+		go func() {
+			ticker := time.NewTicker(interval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-d.sweepStop:
+					return
+				case <-ticker.C:
+					d.sweepExpired()
+				}
+			}
+		}()
+	})
+}
+
+// sweepExpired purges expired records bucket by bucket. Keys are collected
+// under the cursor first and deleted afterwards: bbolt cursors see a stable
+// view, and mutation mid-iteration is undefined for the page being walked.
+func (d *DB) sweepExpired() {
+	var buckets [][]byte
+	if err := d.db.View(func(tx *bbolt.Tx) error {
+		return tx.ForEach(func(name []byte, _ *bbolt.Bucket) error {
+			buckets = append(buckets, bytes.Clone(name))
+			return nil
+		})
+	}); err != nil {
+		return // closed or unreadable: nothing to sweep
+	}
+	now := time.Now().UnixNano()
+	for _, name := range buckets {
+		_ = d.db.Update(func(tx *bbolt.Tx) error {
+			bt := tx.Bucket(name)
+			if bt == nil {
+				return nil
+			}
+			var dead [][]byte
+			c := bt.Cursor()
+			for k, v := c.First(); k != nil; k, v = c.Next() {
+				if len(v) >= headerSize &&
+					int64(binary.BigEndian.Uint64(v[:headerSize])) <= now {
+					dead = append(dead, bytes.Clone(k))
+				}
+			}
+			for _, k := range dead {
+				if err := bt.Delete(k); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+	}
+}
+
+// Close releases the file lock and flushes pending writes. It also stops a
+// sweeper started by StartSweeper.
+func (d *DB) Close() error {
+	d.closeOnce.Do(func() { close(d.sweepStop) })
+	return d.db.Close()
+}
 
 // sanitizeBucket maps a logical bucket id onto a legal bbolt bucket name by
 // replacing every rune outside [A-Za-z0-9_.-] with '_'. The engine builds

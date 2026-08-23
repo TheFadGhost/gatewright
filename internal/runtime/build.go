@@ -6,6 +6,7 @@ import (
 	"net/http"
 
 	"gatewright/internal/config"
+	"gatewright/internal/errs"
 	"gatewright/internal/limiter"
 	"gatewright/internal/middleware"
 	"gatewright/internal/obs"
@@ -126,11 +127,13 @@ func (s *Supervisor) buildRuntime(cfg *config.Config) (*Runtime, error) {
 			mirrorPool = mp
 		}
 		rt.routeFwd[route.Name] = proxy.NewForwarder(proxy.ForwarderOpts{
-			Pool:       fwdPool,
-			MirrorPool: mirrorPool,
-			Timeout:    route.Timeout.D,
-			Transport:  poolTransport(fwdPool),
-			Logger:     s.logger,
+			Pool:        fwdPool,
+			StripPrefix: route.StripPrefix,
+			MirrorPool:  mirrorPool,
+			Mirror:      route.Mirror,
+			Timeout:     route.Timeout.D,
+			Transport:   poolTransport(fwdPool),
+			Logger:      s.logger,
 		})
 
 		for li := range route.RateLimits {
@@ -157,6 +160,7 @@ func (s *Supervisor) buildRuntime(cfg *config.Config) (*Runtime, error) {
 				Backend:  backendOrNil(rl.Backend, backend),
 				MaxKeys:  rl.MaxKeys,
 				Metrics:  s.sink,
+				Logger:   s.logger,
 			})
 			if err != nil {
 				cancel()
@@ -171,6 +175,13 @@ func (s *Supervisor) buildRuntime(cfg *config.Config) (*Runtime, error) {
 		}
 	}
 
+	// Route chains are built eagerly (never lazily on first request) so a
+	// construction failure rejects the reload here instead of crashing a
+	// live request later.
+	if err := rt.buildChains(s.logger, s.metrics); err != nil {
+		cancel()
+		return nil, err
+	}
 	rt.handler = rt.assemble(s.logger, s.metrics)
 	return rt, nil
 }
@@ -214,7 +225,10 @@ func (s *Supervisor) needsStore(cfg *config.Config) bool {
 }
 
 func (s *Supervisor) openStore(path string) (limiter.Backend, error) {
-	if s.store != nil && s.storePath == path {
+	if s.store != nil {
+		if s.storePath != path {
+			return nil, fmt.Errorf("%w (current: %s)", errs.ErrStorePathImmutable, s.storePath)
+		}
 		return s.store, nil
 	}
 	db, err := storeOpen(path)

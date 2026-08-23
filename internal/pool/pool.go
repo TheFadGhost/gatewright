@@ -67,21 +67,22 @@ type Picker interface {
 
 // Outcome summarises one attempt against a target.
 type Outcome struct {
-	Success    bool
-	Status     int         // upstream response status (0 if transport error)
-	ErrClass   ErrClass    // classification when Success == false
-	Latency    time.Duration
+	Success  bool
+	Status   int      // upstream response status (0 if transport error)
+	ErrClass ErrClass // classification when Success == false
+	Latency  time.Duration
 }
 
 // ErrClass categorises failures for passive health and breaker logic.
 type ErrClass int
 
 const (
-	ErrNone ErrClass = iota
-	ErrConnect     // dial/TLS handshake failure or timeout
-	ErrResponse    // read/write failure mid-response, reset conn, malformed
-	ErrHTTP5xx     // upstream answered 5xx
-	ErrTimeout     // context deadline exceeded
+	ErrNone     ErrClass = iota
+	ErrConnect           // dial/TLS handshake failure or timeout
+	ErrResponse          // read/write failure mid-response, reset conn, malformed
+	ErrHTTP5xx           // upstream answered 5xx
+	ErrTimeout           // context deadline exceeded
+	ErrCanceled          // client went away: never counts against passive health or the breaker
 )
 
 // Pool is one named group of targets behind routes.
@@ -103,19 +104,19 @@ type Pool interface {
 
 // Config carries validated settings from config.Upstream plus its name.
 type Config struct {
-	Name            string
-	Targets         []TargetConfig
-	LoadBalance     string
-	HashKey         string
-	ConnectTimeout  time.Duration
-	ReadTimeout     time.Duration
-	WriteTimeout    time.Duration
-	Keepalive       time.Duration
-	MaxIdlePerHost  int
-	VerifyTLS       bool
-	Active          ActiveConfig
-	Passive         PassiveConfig
-	Breaker         BreakerConfig
+	Name           string
+	Targets        []TargetConfig
+	LoadBalance    string
+	HashKey        string
+	ConnectTimeout time.Duration
+	ReadTimeout    time.Duration
+	WriteTimeout   time.Duration
+	Keepalive      time.Duration
+	MaxIdlePerHost int
+	VerifyTLS      bool
+	Active         ActiveConfig
+	Passive        PassiveConfig
+	Breaker        BreakerConfig
 }
 
 type TargetConfig struct {
@@ -154,18 +155,6 @@ var ErrNoHealthy = errNoHealthy{}
 type errNoHealthy struct{}
 
 func (errNoHealthy) Error() string { return "no healthy upstream available" }
-
-// Clock abstracts time for deterministic tests.
-type Clock interface {
-	Now() time.Time
-}
-
-type realClock struct{}
-
-func (realClock) Now() time.Time { return time.Now() }
-
-// RealClock is the production clock.
-var RealClock Clock = realClock{}
 
 // Shared registry helpers so route configs resolve pools by name exactly once.
 

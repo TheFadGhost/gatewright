@@ -117,7 +117,7 @@ func (s *Size) UnmarshalYAML(node *yaml.Node) error {
 	return nil
 }
 
-func (s *Size) IsSet() bool         { return s.set }
+func (s *Size) IsSet() bool          { return s.set }
 func (s *Size) Pos() (line, col int) { return s.line, s.col }
 func (s *Size) ParseError() (string, bool) {
 	if s.err == nil {
@@ -180,7 +180,7 @@ func (d *Duration) Issue(path string) *Error {
 	return &Error{Line: d.line, Column: d.col, Path: path,
 		Expected: "duration string with unit suffix (e.g. \"30s\", \"500ms\")",
 		Found:    d.err.msg, Code: CodeInvalidValue,
-		Hint:     "bare integers are rejected so units are never guessed"}
+		Hint: "bare integers are rejected so units are never guessed"}
 }
 
 // Issue reports size parse problems with position.
@@ -191,7 +191,7 @@ func (s *Size) Issue(path string) *Error {
 	return &Error{Line: s.line, Column: s.col, Path: path,
 		Expected: "size string with unit suffix (e.g. \"16KiB\", \"512B\")",
 		Found:    s.err.msg, Code: CodeInvalidValue,
-		Hint:     "bare integers are rejected so units are never guessed"}
+		Hint: "bare integers are rejected so units are never guessed"}
 }
 
 // Issue reports body-limit parse problems with position.
@@ -286,7 +286,9 @@ type Upstream struct {
 	CircuitBreaker    CircuitBreaker `yaml:"circuit_breaker"`
 }
 
-func (u *Upstream) VerifyTLSOrDefault() bool { return u.VerifyUpstreamTLS == nil || *u.VerifyUpstreamTLS }
+func (u *Upstream) VerifyTLSOrDefault() bool {
+	return u.VerifyUpstreamTLS == nil || *u.VerifyUpstreamTLS
+}
 
 type Target struct {
 	URL    string `yaml:"url"`
@@ -325,22 +327,22 @@ type CircuitBreaker struct {
 }
 
 type Route struct {
-	Name        string            `yaml:"name"`
-	Hosts       []string          `yaml:"hosts"`
-	PathPrefix  string            `yaml:"path_prefix"`
-	PathPattern string            `yaml:"path_pattern"`
-	Methods     []string          `yaml:"methods"`
-	MatchHeaders []HeaderPredicate `yaml:"match_headers"`
-	Upstreams   string            `yaml:"upstreams"`
-	StripPrefix bool              `yaml:"strip_prefix"`
-	Timeout     Duration          `yaml:"timeout"`
-	BodyLimit   BodyLimit         `yaml:"body_limit"`
-	Mirror      *Mirror           `yaml:"mirror"`
-	RequestHeaders HeaderManip    `yaml:"request_headers"`
-	ResponseHeaders HeaderManip   `yaml:"response_headers"`
-	CORS        *CORS             `yaml:"cors"`
-	Auth        *Auth             `yaml:"auth"`
-	RateLimits  []RateLimit       `yaml:"rate_limits"`
+	Name            string            `yaml:"name"`
+	Hosts           []string          `yaml:"hosts"`
+	PathPrefix      string            `yaml:"path_prefix"`
+	PathPattern     string            `yaml:"path_pattern"`
+	Methods         []string          `yaml:"methods"`
+	MatchHeaders    []HeaderPredicate `yaml:"match_headers"`
+	Upstreams       string            `yaml:"upstreams"`
+	StripPrefix     bool              `yaml:"strip_prefix"`
+	Timeout         Duration          `yaml:"timeout"`
+	BodyLimit       BodyLimit         `yaml:"body_limit"`
+	Mirror          *Mirror           `yaml:"mirror"`
+	RequestHeaders  HeaderManip       `yaml:"request_headers"`
+	ResponseHeaders HeaderManip       `yaml:"response_headers"`
+	CORS            *CORS             `yaml:"cors"`
+	Auth            *Auth             `yaml:"auth"`
+	RateLimits      []RateLimit       `yaml:"rate_limits"`
 }
 
 type HeaderPredicate struct {
@@ -389,28 +391,27 @@ type JWTAuth struct {
 }
 
 type RateLimit struct {
-	Name     string         `yaml:"name"`
-	Strategy string         `yaml:"strategy"`
-	Key      string         `yaml:"key"`
-	Limit    int64          `yaml:"limit"`
-	Window   Duration       `yaml:"window"`
-	Burst    int64          `yaml:"burst"`
-	Capacity int64          `yaml:"capacity"`
-	Cells    int            `yaml:"cells"`
-	MaxKeys  int            `yaml:"max_keys"`
-	Backend  string         `yaml:"backend"`
-	Settings map[string]any `yaml:"-"` // resolved strategy settings handed to Factory
+	Name     string   `yaml:"name"`
+	Strategy string   `yaml:"strategy"`
+	Key      string   `yaml:"key"`
+	Limit    int64    `yaml:"limit"`
+	Window   Duration `yaml:"window"`
+	Burst    int64    `yaml:"burst"`
+	Capacity int64    `yaml:"capacity"`
+	Cells    int      `yaml:"cells"`
+	MaxKeys  int      `yaml:"max_keys"`
+	Backend  string   `yaml:"backend"`
 }
 
 // Enum vocabularies (single source of truth for validation and docs).
 
 var (
-	FormatsAccessLog  = []string{"json", "human"}
-	LoadBalancers     = []string{"round_robin", "least_connections", "ring_hash"}
-	TLSVersions       = []string{"tls10", "tls11", "tls12", "tls13"}
-	JWTAlgorithms     = []string{"HS256", "HS384", "HS512", "RS256", "RS384", "RS512", "ES256", "ES384", "ES512"}
-	AuthTypes         = []string{"none", "api_key", "jwt"}
-	LimiterBackends   = []string{"memory", "shared"}
+	FormatsAccessLog = []string{"json", "human"}
+	LoadBalancers    = []string{"round_robin", "least_connections", "ring_hash"}
+	TLSVersions      = []string{"tls12", "tls13"} // TLS < 1.2 unsupported pre-1.0
+	JWTAlgorithms    = []string{"HS256", "HS384", "HS512", "RS256", "RS384", "RS512", "ES256", "ES384", "ES512"}
+	AuthTypes        = []string{"none", "api_key", "jwt"}
+	LimiterBackends  = []string{"memory", "shared"}
 )
 
 func enumList(vals []string) string { return strings.Join(vals, ", ") }
@@ -445,8 +446,8 @@ func (e *Error) Error() string {
 
 // ValidationError wraps every problem found while loading one config.
 type ValidationError struct {
-	File    string
-	Errors  []*Error
+	File   string
+	Errors []*Error
 }
 
 func (v *ValidationError) Error() string {

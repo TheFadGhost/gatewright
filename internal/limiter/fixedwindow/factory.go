@@ -7,8 +7,8 @@ import (
 	"gatewright/internal/limiter"
 )
 
-// StrategyName is the config-facing name of this strategy.
-const StrategyName = "fixed_window"
+// strategyName is the config-facing name of this strategy.
+const strategyName = "fixed_window"
 
 // Factory builds a fixed_window limiter from validated settings.
 func Factory(p limiter.Params) (limiter.Limiter, error) {
@@ -16,7 +16,7 @@ func Factory(p limiter.Params) (limiter.Limiter, error) {
 	if err != nil {
 		return nil, err
 	}
-	return limiter.NewEngine(StrategyName, algo{cfg: cfg}, p), nil
+	return limiter.NewEngine(strategyName, algo{cfg: cfg}, p), nil
 }
 
 func configFrom(s limiter.Settings) (Config, error) {
@@ -43,6 +43,6 @@ func Checker(s limiter.Settings) []string {
 }
 
 func init() {
-	limiter.Register(StrategyName, Factory)
-	limiter.RegisterChecker(StrategyName, Checker)
+	limiter.Register(strategyName, Factory)
+	limiter.RegisterChecker(strategyName, Checker)
 }

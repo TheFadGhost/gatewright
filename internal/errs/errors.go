@@ -4,9 +4,15 @@ package errs
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 )
+
+// ErrStorePathImmutable is returned when a reload attempts to change
+// store.path: the shared limiter database cannot be swapped at runtime, so
+// such reloads are rejected until the process is restarted.
+var ErrStorePathImmutable = errors.New("store.path changes require a restart")
 
 // Configuration errors (never returned over HTTP; they fail load/validate).
 const (
@@ -22,6 +28,7 @@ const (
 const (
 	CodeNoRoute           = "RT001"
 	CodeMethodNotAllowed  = "RT002"
+	CodeInvalidPath       = "RT003"
 	CodeUnauthorized      = "AUTH001"
 	CodeForbidden         = "AUTH002"
 	CodeRateLimited       = "RATE001"
@@ -43,6 +50,8 @@ func HTTPStatus(code string) int {
 		return http.StatusNotFound
 	case CodeMethodNotAllowed:
 		return http.StatusMethodNotAllowed
+	case CodeInvalidPath:
+		return http.StatusBadRequest
 	case CodeUnauthorized:
 		return http.StatusUnauthorized
 	case CodeForbidden:

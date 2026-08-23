@@ -12,7 +12,7 @@ server:
   # tls:
   #   cert_file: certs/tls.crt
   #   key_file: certs/tls.key
-  #   min_version: tls12    # default tls12; tls10/tls11 log loud warnings
+  #   min_version: tls12    # default tls12; accepts tls12 | tls13 only
 
 admin:
   listen: "127.0.0.1:9901" # default "127.0.0.1:9901"

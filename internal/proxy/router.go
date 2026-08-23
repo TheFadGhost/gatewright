@@ -87,9 +87,9 @@ type compiledRoute struct {
 	idx       int
 	route     *config.Route
 	hosts     []hostPred
-	litPrefix string        // normalized path_prefix ("" when unset)
-	pattern   []patternSeg  // nil when no path_pattern
-	patPrefix string        // literal head of the pattern ("", or "/", ...)
+	litPrefix string       // normalized path_prefix ("" when unset)
+	pattern   []patternSeg // nil when no path_pattern
+	patPrefix string       // literal head of the pattern ("", or "/", ...)
 	headers   []headerPred
 }
 
@@ -159,11 +159,11 @@ func compileRoute(idx int, r *config.Route) (*compiledRoute, error) {
 
 // Match resolves r to the highest-precedence route (DESIGN.md §2):
 //
-//	1. host specificity      (exact > wildcard > no host predicate)
-//	2. static path segments  (x2 integral scale; {param} scores 1 of 2)
-//	3. method-restricted beats unrestricted
-//	4. more header predicates beat fewer
-//	5. ties resolve to config order (earlier wins)
+//  1. host specificity      (exact > wildcard > no host predicate)
+//  2. static path segments  (x2 integral scale; {param} scores 1 of 2)
+//  3. method-restricted beats unrestricted
+//  4. more header predicates beat fewer
+//  5. ties resolve to config order (earlier wins)
 //
 // No route matches at all => APIError RT001 (404). A route matches on
 // host+path but its method/header predicates exclude the request => RT002
@@ -172,6 +172,9 @@ func compileRoute(idx int, r *config.Route) (*compiledRoute, error) {
 func (rt *Router) Match(r *http.Request) (*RouteMatch, *errs.APIError) {
 	host := hostFromRequest(r)
 	clean := cleanRequestPath(r.URL.EscapedPath())
+	if pathHasDotSegments(clean) {
+		return nil, errs.New(errs.CodeInvalidPath, "invalid request path")
+	}
 
 	bestIdx := -1
 	bestHost, bestPath, bestMeth, bestHdr := 0, 0, 0, 0
@@ -408,6 +411,31 @@ func cleanRequestPath(escaped string) string {
 		return "/"
 	}
 	return c
+}
+
+// pathHasDotSegments decodes each segment of the cleaned ESCAPED path and
+// reports whether any of them resolves to "." or "..". Lexical cleaning above
+// operates on the escaped form, so "/v1/%2e%2e/etc" survives path.Clean
+// unchanged while decoding to a traversal; such paths are rejected outright
+// (RT003) rather than silently normalized, both here in Match and in the
+// forwarder's upstream-path construction, so authentication/routing and the
+// forwarded target always agree on one interpretation. "%2F" inside a
+// segment decodes to "/" but is NOT a segment boundary: it never triggers
+// rejection and stays percent-encoded on the wire.
+func pathHasDotSegments(cleaned string) bool {
+	for _, seg := range strings.Split(cleaned, "/") {
+		if seg == "" {
+			continue
+		}
+		dec, err := url.PathUnescape(seg)
+		if err != nil {
+			continue // invalid escape: left verbatim downstream
+		}
+		if dec == "." || dec == ".." {
+			return true
+		}
+	}
+	return false
 }
 
 // normalizePrefix canonicalizes a configured path prefix: leading slash,

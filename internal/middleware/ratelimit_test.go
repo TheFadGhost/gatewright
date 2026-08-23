@@ -3,6 +3,7 @@ package middleware
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -116,6 +117,35 @@ func TestRateLimitDenialShortCircuits(t *testing.T) {
 	}
 	if never.callCount() != 0 {
 		t.Fatalf("denial did not short-circuit: second limiter called %d times", never.callCount())
+	}
+}
+
+func TestRateLimitDenialMessageNeverEchoesKey(t *testing.T) {
+	const secretKey = "sk-live-super-secret-42"
+	l := &fakeLimiter{dec: denyDecision(1, time.Second, time.Second)}
+	injector := func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			next.ServeHTTP(w, r.WithContext(WithIdentity(r.Context(), &Identity{APIKey: secretKey})))
+		})
+	}
+	rec := httptest.NewRecorder()
+	Chain(okHandler(""), injector, NewRequestID(),
+		NewRateLimit([]RateLimitEntry{{Limiter: l, KeyFn: mustExtractor(t, "api_key"), Name: "ip-burst"}}, nil)).
+		ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429", rec.Code)
+	}
+	body := rec.Body.String()
+	env := decodeEnvelope(t, rec)
+	if env.Error.Code != errs.CodeRateLimited {
+		t.Fatalf("code = %q", env.Error.Code)
+	}
+	if strings.Contains(body, secretKey) {
+		t.Errorf("denial body %q echoes the bucket key; it must never be surfaced to clients", body)
+	}
+	want := "quota exceeded (limiter ip-burst)"
+	if !strings.Contains(env.Error.Message, want) {
+		t.Errorf("message = %q, want it to name the limiter via %q", env.Error.Message, want)
 	}
 }
 

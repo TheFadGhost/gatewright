@@ -113,13 +113,13 @@ type StateDTO struct {
 
 func targetToDTO(t pool.TargetStatus) TargetDTO {
 	dto := TargetDTO{
-		Name:     t.Name,
-		URL:      t.URL,
-		Weight:   t.Weight,
-		State:    t.State.String(),
-		Inflight: t.Inflight,
-		Failures: t.Failures,
-		TotalReq: t.TotalReq,
+		Name:      t.Name,
+		URL:       t.URL,
+		Weight:    t.Weight,
+		State:     t.State.String(),
+		Inflight:  t.Inflight,
+		Failures:  t.Failures,
+		TotalReq:  t.TotalReq,
 		TotalFail: t.TotalFail,
 	}
 	if t.CircuitOpen {

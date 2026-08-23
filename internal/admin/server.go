@@ -3,7 +3,9 @@ package admin
 import (
 	"encoding/json"
 	"log"
+	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -63,7 +65,48 @@ func New(sp SnapshotProvider, opts Options) *Server {
 // ServeHTTP applies authentication then dispatches to the admin mux.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Content-Type-Options", "nosniff")
-	s.withAuth(s.mux).ServeHTTP(w, r)
+	s.withAuth(s.loopbackGuard(s.mux)).ServeHTTP(w, r)
+}
+
+// loopbackGuard defends tokenless deployments against Host-header spoofing
+// and DNS-rebinding: when no bearer token is configured, only requests whose
+// Host targets a loopback form (127.0.0.1, ::1, localhost — with or without
+// port) are served; anything else answers 403 AUTH002. With a token
+// configured the guard steps aside entirely: the bearer check is the gate.
+func (s *Server) loopbackGuard(next http.Handler) http.Handler {
+	if s.opts.AuthToken != "" {
+		return next
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !loopbackHost(r.Host) {
+			writeAdminError(w, http.StatusForbidden,
+				errs.CodeForbidden,
+				"tokenless admin API is restricted to loopback hosts")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// loopbackHost reports whether the Host header value (host or host:port,
+// IPv6 brackets tolerated) names a loopback endpoint.
+func loopbackHost(hostPort string) bool {
+	hp := strings.TrimSpace(hostPort)
+	if hp == "" {
+		return false // fail closed: HTTP/1.1 requests always carry Host
+	}
+	host := hp
+	if h, _, err := net.SplitHostPort(hp); err == nil {
+		host = h
+	} else if strings.HasPrefix(hp, "[") && strings.HasSuffix(hp, "]") {
+		host = hp[1 : len(hp)-1]
+	}
+	switch strings.ToLower(host) {
+	case "127.0.0.1", "::1", "localhost":
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *Server) buildState() StateDTO {

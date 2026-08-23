@@ -19,6 +19,7 @@ import (
 
 	"gatewright/internal/config"
 	"gatewright/internal/errs"
+	"gatewright/internal/middleware"
 	"gatewright/internal/obs"
 	"gatewright/internal/pool"
 )
@@ -41,12 +42,12 @@ type fakePool struct {
 	dones   []recordedDone
 }
 
-func (p *fakePool) Name() string { return "fake" }
+func (p *fakePool) Name() string                { return "fake" }
 func (p *fakePool) Status() []pool.TargetStatus { return nil }
-func (p *fakePool) Healthy(int) bool { return !p.pickErr }
-func (p *fakePool) Start(context.Context) {}
-func (p *fakePool) Drain(time.Duration) {}
-func (p *fakePool) Close() {}
+func (p *fakePool) Healthy(int) bool            { return !p.pickErr }
+func (p *fakePool) Start(context.Context)       {}
+func (p *fakePool) Drain(time.Duration)         {}
+func (p *fakePool) Close()                      {}
 
 func (p *fakePool) Pick(string) (*pool.Target, error) {
 	p.mu.Lock()
@@ -545,7 +546,9 @@ func TestRetryGetConnectionResetThenSuccess(t *testing.T) {
 	gw := httptest.NewServer(newGateway(t,
 		[]config.Route{{Name: "r1", PathPrefix: "/", Upstreams: "u"}},
 		map[string]pool.Pool{"u": pl},
-		func(o *ForwarderOpts) { o.Retry = RetryPolicy{Attempts: 3, BaseDelay: time.Millisecond, MaxDelay: 3 * time.Millisecond} },
+		func(o *ForwarderOpts) {
+			o.Retry = RetryPolicy{Attempts: 3, BaseDelay: time.Millisecond, MaxDelay: 3 * time.Millisecond}
+		},
 	))
 	t.Cleanup(gw.Close)
 
@@ -581,7 +584,9 @@ func TestRetryExhaustedPassesUpstreamStatusThrough(t *testing.T) {
 	gw := httptest.NewServer(newGateway(t,
 		[]config.Route{{Name: "r1", PathPrefix: "/", Upstreams: "u"}},
 		map[string]pool.Pool{"u": poolOf(up)},
-		func(o *ForwarderOpts) { o.Retry = RetryPolicy{Attempts: 3, BaseDelay: time.Millisecond, MaxDelay: 2 * time.Millisecond} },
+		func(o *ForwarderOpts) {
+			o.Retry = RetryPolicy{Attempts: 3, BaseDelay: time.Millisecond, MaxDelay: 2 * time.Millisecond}
+		},
 	))
 	t.Cleanup(gw.Close)
 
@@ -618,7 +623,9 @@ func TestSmallBodyIdempotentRetryUsesBuffer(t *testing.T) {
 	gw := httptest.NewServer(newGateway(t,
 		[]config.Route{{Name: "r1", PathPrefix: "/", Upstreams: "u"}},
 		map[string]pool.Pool{"u": poolOf(up)},
-		func(o *ForwarderOpts) { o.Retry = RetryPolicy{Attempts: 3, BaseDelay: time.Millisecond, MaxDelay: 2 * time.Millisecond} },
+		func(o *ForwarderOpts) {
+			o.Retry = RetryPolicy{Attempts: 3, BaseDelay: time.Millisecond, MaxDelay: 2 * time.Millisecond}
+		},
 	))
 	t.Cleanup(gw.Close)
 
@@ -676,7 +683,9 @@ func TestBackoffBoundedByMaxDelay(t *testing.T) {
 	gw := httptest.NewServer(newGateway(t,
 		[]config.Route{{Name: "r1", PathPrefix: "/", Upstreams: "u"}},
 		map[string]pool.Pool{"u": poolOf(up)},
-		func(o *ForwarderOpts) { o.Retry = RetryPolicy{Attempts: 4, BaseDelay: 5 * time.Millisecond, MaxDelay: 6 * time.Millisecond} },
+		func(o *ForwarderOpts) {
+			o.Retry = RetryPolicy{Attempts: 4, BaseDelay: 5 * time.Millisecond, MaxDelay: 6 * time.Millisecond}
+		},
 	))
 	t.Cleanup(gw.Close)
 	resp, err := http.Get(gw.URL + "/x")
@@ -1018,4 +1027,379 @@ func TestProtocolUpgradePassthrough(t *testing.T) {
 
 func poolOfFromURL(raw string) *fakePool {
 	return &fakePool{targets: []*pool.Target{{Name: "ws[0]", URL: "http://" + raw, Weight: 1}}}
+}
+
+// ---------------------------------------------------------------------------
+// Audit fixes: path normalization, hash-key wiring, client-cancel
+// classification, ErrAbortHandler propagation, context request ids.
+// ---------------------------------------------------------------------------
+
+// waitForCond polls cond until true or the deadline expires (no blind sleeps).
+func waitForCond(t *testing.T, d time.Duration, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
+}
+
+func TestEncodedDotSegmentsRejectedEndToEnd(t *testing.T) {
+	up, log := newRecordingUpstream(t, func(w http.ResponseWriter, r *http.Request, nth int) {})
+	gw := httptest.NewServer(newGateway(t,
+		[]config.Route{{Name: "r1", PathPrefix: "/v1", Upstreams: "u"}},
+		map[string]pool.Pool{"u": poolOf(up)}, nil))
+	t.Cleanup(gw.Close)
+
+	for _, p := range []string{"/v1/%2e%2e/admin", "/v1/x/%2E%2e/y", "/%2e./v1/z"} {
+		resp, err := http.Get(gw.URL + p)
+		if err != nil {
+			t.Fatalf("GET %s: %v", p, err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("GET %s: status = %d, want 400 RT003", p, resp.StatusCode)
+		}
+		if env := decodeEnvelope(t, body); env.Error.Code != errs.CodeInvalidPath {
+			t.Errorf("GET %s: code = %q, want RT003", p, env.Error.Code)
+		}
+	}
+	if log.n() != 0 {
+		t.Errorf("upstream hit %d times; traversal must be rejected before forwarding", log.n())
+	}
+
+	// Contrast: an encoded slash inside a segment is legitimate and forwarded
+	// with its escaping intact ("%2F stays percent-encoded on the wire").
+	resp, err := http.Get(gw.URL + "/v1/a%2Fb")
+	if err != nil {
+		t.Fatalf("GET encoded slash: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || log.n() != 1 {
+		t.Fatalf("encoded-slash request: status=%d hits=%d, want 200/1", resp.StatusCode, log.n())
+	}
+	if !strings.Contains(log.paths[0], "a/b") && !strings.Contains(log.paths[0], "a%2Fb") {
+		t.Errorf("upstream path = %q, want the a%%2Fb segment preserved", log.paths[0])
+	}
+}
+
+func TestWriteErrorPrefersContextRequestID(t *testing.T) {
+	up, _ := newRecordingUpstream(t, nil)
+	f := NewForwarder(ForwarderOpts{
+		Pool:      poolOf(up),
+		Transport: &http.Transport{},
+		Retry:     RetryPolicy{Attempts: 1},
+	})
+
+	rec := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/", nil)
+	f.writeError(rec, r.WithContext(middleware.WithRequestID(r.Context(), "ctx-id-123")),
+		errs.CodeNoHealthyUpstream, "x")
+	if env := decodeEnvelope(t, rec.Body.Bytes()); env.Error.ReqID != "ctx-id-123" {
+		t.Errorf("req_id = %q, want ctx value ctx-id-123", env.Error.ReqID)
+	}
+
+	rec2 := httptest.NewRecorder()
+	r2 := httptest.NewRequest(http.MethodGet, "/", nil)
+	r2.Header.Set(middleware.RequestIDHeader, "hdr-id-9")
+	f.writeError(rec2, r2, errs.CodeBadGateway, "x")
+	if got := decodeEnvelope(t, rec2.Body.Bytes()).Error.ReqID; got != "hdr-id-9" {
+		t.Errorf("fallback req_id = %q, want header value hdr-id-9", got)
+	}
+}
+
+func TestClientCancelClassifiedErrCanceledNotConnect(t *testing.T) {
+	release := make(chan struct{})
+	up, log := newRecordingUpstream(t, func(w http.ResponseWriter, r *http.Request, nth int) {
+		select {
+		case <-release:
+		case <-time.After(10 * time.Second):
+		}
+		w.WriteHeader(200)
+	})
+	pl := poolOf(up)
+	gwHandler := newGateway(t,
+		[]config.Route{{Name: "r1", PathPrefix: "/", Upstreams: "u"}},
+		map[string]pool.Pool{"u": pl},
+		func(o *ForwarderOpts) { o.Retry = RetryPolicy{Attempts: 3} },
+	)
+	gw := httptest.NewServer(gwHandler)
+	t.Cleanup(gw.Close)
+
+	req, _ := http.NewRequest(http.MethodGet, gw.URL+"/x", nil)
+	ctx, cancel := context.WithCancel(req.Context())
+	req = req.WithContext(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		resp, err := http.DefaultClient.Do(req) // canceled mid-flight by design
+		if err == nil {
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}
+	}()
+	// Wait until the attempt is parked inside the upstream BEFORE hanging up,
+	// so the cancellation lands mid-round-trip deterministically.
+	waitForCond(t, 5*time.Second, "attempt to reach the upstream", func() bool {
+		return log.n() >= 1
+	})
+	cancel() // the client hangs up
+
+	var last pool.Outcome
+	waitForCond(t, 5*time.Second, "canceled outcome to be reported to the pool", func() bool {
+		dones := pl.doneSnapshot()
+		if len(dones) == 0 {
+			return false
+		}
+		last = dones[len(dones)-1].outcome
+		return true
+	})
+	close(release) // let the upstream handler finish so teardown is clean
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("client request never returned after cancellation")
+	}
+
+	if last.Success {
+		t.Errorf("outcome = %+v, want failure classification", last)
+	}
+	if last.ErrClass != pool.ErrCanceled {
+		t.Errorf("ErrClass = %v, want ErrCanceled (client cancels never blame the target)", last.ErrClass)
+	}
+}
+
+func TestErrAbortHandlerPropagatesUnwrapped(t *testing.T) {
+	// Upstream sends headers plus a partial body, then slams the connection
+	// shut. ReverseProxy's mid-stream copy fails and it panics with
+	// http.ErrAbortHandler; the forwarder must neither swallow nor wrap it.
+	upSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte("partial"))
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		hj := w.(http.Hijacker)
+		if conn, _, herr := hj.Hijack(); herr == nil {
+			_ = conn.Close()
+		}
+	}))
+	t.Cleanup(upSrv.Close)
+
+	f := NewForwarder(ForwarderOpts{
+		Pool:      poolOf(upSrv),
+		Transport: &http.Transport{},
+		Retry:     RetryPolicy{Attempts: 1},
+	})
+
+	type outcome struct {
+		panicked bool
+		val      any
+	}
+	ch := make(chan outcome, 1)
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() { ch <- outcome{panicked: true, val: recover()} }()
+		f.ServeHTTP(w, r, &RouteMatch{Route: &config.Route{Name: "r"}})
+	})
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+
+	resp, err := (&http.Client{}).Get(srv.URL + "/abort")
+	if err == nil {
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+	}
+
+	select {
+	case o := <-ch:
+		if !o.panicked {
+			t.Fatal("forwarder swallowed the mid-stream abort; ErrAbortHandler must propagate")
+		}
+		if o.val != http.ErrAbortHandler {
+			t.Fatalf("panic value = %v (%T), want unwrapped http.ErrAbortHandler", o.val, o.val)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler never returned after abort")
+	}
+}
+
+func TestHashKeySpecRoutesConsistentlyThroughRingHash(t *testing.T) {
+	up1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("one"))
+	}))
+	t.Cleanup(up1.Close)
+	up2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("two"))
+	}))
+	t.Cleanup(up2.Close)
+
+	p := pool.New(pool.Config{
+		Name:        "rh",
+		LoadBalance: "ring_hash",
+		Targets: []pool.TargetConfig{
+			{URL: up1.URL, Weight: 1},
+			{URL: up2.URL, Weight: 1},
+		},
+		Passive: pool.PassiveConfig{Window: time.Hour, Failures: 1 << 30, EjectionTime: time.Hour},
+		Breaker: pool.BreakerConfig{Failures: 1 << 30, Window: time.Hour, Cooldown: time.Hour, HalfOpenProbes: 1},
+	})
+	defer p.Close()
+
+	// The forwarder keys requests through the middleware extractor; probes
+	// must build the identical key ("header\x00<value>") or they would query
+	// a different ring position than production traffic.
+	spec, err := config.ParseKeySpec("header:X-Session")
+	if err != nil {
+		t.Fatalf("ParseKeySpec: %v", err)
+	}
+	keyFn, err := middleware.BuildKeyExtractor(*spec)
+	if err != nil {
+		t.Fatalf("BuildKeyExtractor: %v", err)
+	}
+	keyOf := func(v string) string {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.Header.Set("X-Session", v)
+		return keyFn(req, nil)
+	}
+
+	// Ask the same pool the forwarder uses which target each key owns, so the
+	// consistency assertions below are deterministic for this build.
+	pickURL := func(key string) string {
+		tgt, err := p.Pick(key)
+		if err != nil {
+			t.Fatalf("Pick(%q): %v", key, err)
+		}
+		p.Done(tgt, pool.Outcome{Success: true, Status: 200})
+		return tgt.URL
+	}
+	var keyA, keyB string
+	found := false
+search:
+	for i := 0; i < 256; i++ {
+		a := fmt.Sprintf("session-%d", i)
+		ua := pickURL(keyOf(a))
+		for j := i + 1; j < 256; j++ {
+			b := fmt.Sprintf("session-%d", j)
+			if ub := pickURL(keyOf(b)); ub != ua {
+				keyA, keyB = a, b
+				found = true
+				break search
+			}
+		}
+	}
+	if !found {
+		t.Fatal("could not locate two keys mapping to distinct targets")
+	}
+	wantA, wantB := pickURL(keyOf(keyA)), pickURL(keyOf(keyB))
+	if wantA == wantB {
+		t.Fatalf("probe targets converged: %q == %q", wantA, wantB)
+	}
+
+	gwHandler := newGateway(t,
+		[]config.Route{{Name: "r1", PathPrefix: "/", Upstreams: "u"}},
+		map[string]pool.Pool{"u": p},
+		func(o *ForwarderOpts) {
+			o.HashKey = "header:X-Session"
+			o.Retry = RetryPolicy{Attempts: 1}
+		},
+	)
+	gw := httptest.NewServer(gwHandler)
+	t.Cleanup(gw.Close)
+
+	getWithSession := func(v string) string {
+		req, _ := http.NewRequest(http.MethodGet, gw.URL+"/sticky", nil)
+		req.Header.Set("X-Session", v)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("GET with session %q: %v", v, err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return string(body)
+	}
+
+	wantFor := map[string]string{wantA: bodyOfTarget(wantA, up1.URL, up2.URL), wantB: bodyOfTarget(wantB, up1.URL, up2.URL)}
+	for i := 0; i < 5; i++ {
+		for key, url := range map[string]string{keyA: wantA, keyB: wantB} {
+			if got := getWithSession(key); got != wantFor[url] {
+				t.Errorf("key %q attempt %d: body = %q, want %q (consistent routing)", key, i, got, wantFor[url])
+			}
+		}
+	}
+}
+
+func bodyOfTarget(url, up1, up2 string) string {
+	switch url {
+	case up1:
+		return "one"
+	default:
+		return "two"
+	}
+}
+
+type keyRecordingPool struct {
+	pool.Pool
+	mu   sync.Mutex
+	keys []string
+}
+
+func (p *keyRecordingPool) Pick(k string) (*pool.Target, error) {
+	p.mu.Lock()
+	p.keys = append(p.keys, k)
+	p.mu.Unlock()
+	return p.Pool.Pick(k)
+}
+
+func (p *keyRecordingPool) lastKey() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.keys) == 0 {
+		return ""
+	}
+	return p.keys[len(p.keys)-1]
+}
+
+func TestForwarderPickKeyUsesExtractorSemantics(t *testing.T) {
+	up, log := newRecordingUpstream(t, func(w http.ResponseWriter, r *http.Request, nth int) {})
+	pl := &keyRecordingPool{Pool: poolOf(up)}
+	gwHandler := newGateway(t,
+		[]config.Route{{Name: "r1", PathPrefix: "/", Upstreams: "u"}},
+		map[string]pool.Pool{"u": pl},
+		func(o *ForwarderOpts) { o.HashKey = "path" },
+	)
+	gw := httptest.NewServer(gwHandler)
+	t.Cleanup(gw.Close)
+
+	resp, err := http.Get(gw.URL + "/anything")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	const want = "path\x00/anything"
+	if got := pl.lastKey(); got != want {
+		t.Errorf("Pick key = %q, want middleware extractor form %q", got, want)
+	}
+	if log.n() != 1 {
+		t.Errorf("hits = %d, want 1", log.n())
+	}
+
+	// Without HashKey configured, the legacy client-IP key applies.
+	pl2 := &keyRecordingPool{Pool: poolOf(up)}
+	gw2 := httptest.NewServer(newGateway(t,
+		[]config.Route{{Name: "r1", PathPrefix: "/", Upstreams: "u"}},
+		map[string]pool.Pool{"u": pl2}, nil))
+	t.Cleanup(gw2.Close)
+	resp2, err := http.Get(gw2.URL + "/legacy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if got := pl2.lastKey(); got != "127.0.0.1" {
+		t.Errorf("legacy Pick key = %q, want client IP 127.0.0.1", got)
+	}
 }

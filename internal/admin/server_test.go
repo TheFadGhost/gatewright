@@ -91,12 +91,30 @@ func (f *fakeProvider) Reload() error {
 	return f.reloadErr
 }
 
-func (f *fakeProvider) Version() string        { return f.version }
-func (f *fakeProvider) Uptime() time.Duration  { return f.uptime }
+func (f *fakeProvider) Version() string       { return f.version }
+func (f *fakeProvider) Uptime() time.Duration { return f.uptime }
 
 func get(t *testing.T, h http.Handler, path, token string) *httptest.ResponseRecorder {
 	t.Helper()
+	return do(t, h, http.MethodGet, path, token, "127.0.0.1:8080")
+}
+
+// getFrom issues a request with an explicit Host header (spoofing included).
+func getFrom(h http.Handler, path, token, host string) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(http.MethodGet, path, nil)
+	req.Host = host
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
+}
+
+func do(t *testing.T, h http.Handler, method, path, token, host string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(method, path, nil)
+	req.Host = host
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
@@ -182,6 +200,7 @@ func TestStateEmDashWhenNoLatencyData(t *testing.T) {
 	fp.latOK = false
 	srv := New(fp, Options{})
 	req := httptest.NewRequest(http.MethodGet, "/admin/api/state", nil)
+	req.Host = "127.0.0.1:8080"
 	rec := httptest.NewRecorder()
 	srv.ServeHTTP(rec, req)
 	r := decodeBody(t, rec)["routes"].([]any)[0].(map[string]any)
@@ -237,13 +256,62 @@ func TestAuthEnforcedWhenTokenConfigured(t *testing.T) {
 
 func TestNoTokenMeansOpenOnTrustedBind(t *testing.T) {
 	srv := New(newFake(), Options{})
-	if code := get(t, srv, "/admin/api/state", "").Code; code != http.StatusOK {
-		t.Errorf("status = %d, want 200 without any header when no token configured", code)
+	for _, host := range []string{"127.0.0.1:8080", "localhost", "localhost:9000", "[::1]:80", "::1", "127.0.0.1"} {
+		if code := getFrom(srv, "/admin/api/state", "", host).Code; code != http.StatusOK {
+			t.Errorf("host %q: status = %d, want 200 without any header when no token configured", host, code)
+		}
+	}
+}
+
+func TestTokenlessAdminRejectsNonLoopbackHost(t *testing.T) {
+	srv := New(newFake(), Options{})
+	for _, host := range []string{
+		"evil.example.com",
+		"192.168.1.5:8080", // private but not loopback
+		"[fe80::1]:8080",
+		"127.0.0.1.evil.com",
+		"2130706433", // decimal IP form of 127.0.0.1 must NOT pass the textual allowlist
+		"",
+	} {
+		rec := getFrom(srv, "/admin/api/state", "", host)
+		if rec.Code != http.StatusForbidden {
+			t.Errorf("host %q: status = %d, want 403", host, rec.Code)
+			continue
+		}
+		env := decodeBody(t, rec)
+		errObj := env["error"].(map[string]any)
+		if errObj["code"] != "AUTH002" {
+			t.Errorf("host %q: error code = %v, want AUTH002", host, errObj["code"])
+		}
+		if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+			t.Errorf("host %q: 403 content-type = %q", host, ct)
+		}
+	}
+}
+
+func TestTokenConfiguredKeepsBearerCheckRegardlessOfHost(t *testing.T) {
+	const tok = "sekret"
+	srv := New(newFake(), Options{AuthToken: tok})
+
+	// Spoofed Host with a valid token: allowed — bearer auth is the gate.
+	if code := getFrom(srv, "/admin/api/state", tok, "evil.example.com").Code; code != http.StatusOK {
+		t.Errorf("spoofed host + valid token: status = %d, want 200", code)
+	}
+	// Spoofed Host without a token: still the bearer failure (401 AUTH001),
+	// never the loopback guard.
+	rec := getFrom(srv, "/admin/api/state", "", "evil.example.com")
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("spoofed host + no token: status = %d, want 401", rec.Code)
+	}
+	env := decodeBody(t, rec)
+	if code := env["error"].(map[string]any)["code"]; code != "AUTH001" {
+		t.Errorf("error code = %v, want AUTH001 (bearer check owns token mode)", code)
 	}
 }
 
 func post(h http.Handler, path, token string) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(http.MethodPost, path, nil)
+	req.Host = "127.0.0.1:8080"
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}

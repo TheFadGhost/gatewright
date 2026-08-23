@@ -4,10 +4,12 @@ package main
 // local development and end-to-end tests. All data is synthetic.
 
 import (
+	"bytes"
 	"crypto/sha1"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -132,6 +134,15 @@ func echoWebsocket(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// maxWSFramePayload caps the decoded payload of a single websocket frame.
+// A peer declaring anything larger gets its connection closed: length
+// headers are attacker-controlled and must never drive our allocations.
+const maxWSFramePayload = 1 << 20
+
+// errWSFrameTooLarge reports a frame whose declared/streamed payload exceeds
+// maxWSFramePayload; the caller closes the connection on sight.
+var errWSFrameTooLarge = errors.New("websocket frame exceeds payload cap")
+
 func readWSFrame(r io.Reader) ([]byte, byte, error) {
 	header := make([]byte, 2)
 	if _, err := io.ReadFull(r, header); err != nil {
@@ -160,9 +171,20 @@ func readWSFrame(r io.Reader) ([]byte, byte, error) {
 			return nil, 0, err
 		}
 	}
-	payload := make([]byte, plen)
-	if _, err := io.ReadFull(r, payload); err != nil {
+	// Stream the payload through a LimitReader into a bounded buffer: a huge
+	// declared length never preallocates, and reading even one byte past the
+	// cap aborts the frame (the connection is closed right after).
+	buf := bytes.NewBuffer(make([]byte, 0, 32*1024))
+	n, err := io.Copy(buf, io.LimitReader(r, maxWSFramePayload+1))
+	if err != nil {
 		return nil, 0, err
+	}
+	if n > maxWSFramePayload {
+		return nil, 0, errWSFrameTooLarge
+	}
+	payload := buf.Bytes()
+	if uint64(len(payload)) < plen {
+		return nil, 0, io.ErrUnexpectedEOF
 	}
 	if masked {
 		for i := range payload {

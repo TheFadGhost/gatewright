@@ -51,12 +51,14 @@ func (rt *Runtime) assemble(logger obs.Logger, metrics *obs.Metrics) http.Handle
 			writeRoutingError(cw, r, apiErr)
 			return
 		}
-		rt.routeChain(logger, metrics, rm.Route).ServeHTTP(cw, WithRouteMatch(r, rm))
+		rt.routeChain(rm.Route.Name).ServeHTTP(cw, WithRouteMatch(r, rm))
 	})
 
 	h := middleware.Chain(dispatcher,
 		middleware.NewRequestID(),
-		middleware.NewAccessLog(logger, "<gateway>"),
+		// An empty constructor route defers to Record.Fields.Route, which the
+		// dispatcher sets from the actual route match (never "<gateway>").
+		middleware.NewAccessLog(logger, ""),
 	)
 	return recoverMiddleware(traceGate(rt.trace, logger, h))
 }
@@ -106,21 +108,49 @@ func (cw *countingWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	return hj.Hijack()
 }
 
-// routeChain assembles each route's middleware stack ending in its forwarder,
-// exactly once per runtime generation. Safe under concurrent first requests.
-func (rt *Runtime) routeChain(logger obs.Logger, metrics *obs.Metrics, route *config.Route) http.Handler {
-	rt.chainMu.RLock()
-	h, ok := rt.chains[route.Name]
-	rt.chainMu.RUnlock()
-	if ok {
-		return h
-	}
+// routeChain returns the pre-built middleware stack for a route. Chains are
+// constructed eagerly during buildRuntime (M7), so this is an immutable map
+// read: safe for concurrent use without locking because the map is fully
+// populated before the generation is published via atomic swap.
+func (rt *Runtime) routeChain(routeName string) http.Handler {
+	return rt.chains[routeName]
+}
 
-	rt.chainMu.Lock()
-	defer rt.chainMu.Unlock()
-	if h, ok := rt.chains[route.Name]; ok {
-		return h // lost the race; another request built it
+// buildChains eagerly constructs every route's middleware chain, recovering
+// construction panics (e.g. a misconfigured NewAuth) into reload-rejecting
+// errors instead of first-request crashes.
+func (rt *Runtime) buildChains(logger obs.Logger, metrics *obs.Metrics) error {
+	for i := range rt.Cfg.Routes {
+		route := &rt.Cfg.Routes[i]
+		h, err := rt.buildRouteChainSafe(logger, metrics, route)
+		if err != nil {
+			return err
+		}
+		rt.chains[route.Name] = h
 	}
+	return nil
+}
+
+func (rt *Runtime) buildRouteChainSafe(logger obs.Logger, metrics *obs.Metrics, route *config.Route) (h http.Handler, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("route %q: middleware chain build failed: %v", route.Name, r)
+		}
+	}()
+	return rt.buildRouteChain(logger, metrics, route), nil
+}
+
+// namedMiddleware pairs a stage with its documented trace name.
+type namedMiddleware struct {
+	name string
+	mw   middleware.Middleware
+}
+
+// buildRouteChain assembles each route's middleware stack ending in its
+// forwarder. Response-headers runs outermost so it decorates every response
+// the route produces, including error envelopes from inner stages; after it,
+// stages follow the documented order of internal/middleware/order.go.
+func (rt *Runtime) buildRouteChain(logger obs.Logger, metrics *obs.Metrics, route *config.Route) http.Handler {
 	fwd := rt.routeFwd[route.Name]
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		rm := RouteMatchFrom(r.Context())
@@ -132,41 +162,37 @@ func (rt *Runtime) routeChain(logger obs.Logger, metrics *obs.Metrics, route *co
 		fwd.ServeHTTP(w, r, rm)
 	})
 
-	var mws []middleware.Middleware
-	if max := route.BodyLimit.MaxBytes(); max >= 0 {
-		mws = append(mws, middleware.NewBodyLimit(max))
+	mws := make([]namedMiddleware, 0, 8)
+	add := func(name string, mw middleware.Middleware) {
+		if mw != nil {
+			mws = append(mws, namedMiddleware{name: name, mw: mw})
+		}
 	}
-	mws = append(mws, middleware.NewTotalTimeout(route.Timeout.D))
+	if rh := route.ResponseHeaders; len(rh.Set)+len(rh.Add)+len(rh.Del) > 0 {
+		add("response-headers", middleware.NewResponseHeaders(rh))
+	}
+	if max := route.BodyLimit.MaxBytes(); max >= 0 {
+		add(middleware.OrderNames[middleware.PosBodyLimit], middleware.NewBodyLimit(max))
+	}
+	add(middleware.OrderNames[middleware.PosTotalTimeout], middleware.NewTotalTimeout(route.Timeout.D))
 	if route.CORS != nil {
-		mws = append(mws, middleware.NewCORS(route.CORS))
+		add(middleware.OrderNames[middleware.PosCORS], middleware.NewCORS(route.CORS))
 	}
 	if route.Auth != nil && route.Auth.Type != "none" && route.Auth.Type != "" {
-		mws = append(mws, middleware.NewAuth(route.Auth))
+		add(middleware.OrderNames[middleware.PosAuth], middleware.NewAuth(route.Auth))
 	}
 	if len(route.RequestHeaders.Set)+len(route.RequestHeaders.Add)+len(route.RequestHeaders.Del) > 0 {
-		mws = append(mws, middleware.NewRequestHeaders(route.RequestHeaders))
+		add(middleware.OrderNames[middleware.PosRequestHeaders], middleware.NewRequestHeaders(route.RequestHeaders))
 	}
 	if entries := rt.entries[route.Name]; len(entries) > 0 {
-		mws = append(mws, middleware.NewRateLimit(entries, metrics))
+		add(middleware.OrderNames[middleware.PosRateLimit], middleware.NewRateLimit(entries, metrics))
 	}
 
 	var timed []middleware.Middleware
-	for i, m := range mws {
-		timed = append(timed, timeStage(stageNames(i, len(mws)), m))
+	for _, nm := range mws {
+		timed = append(timed, timeStage(nm.name, nm.mw))
 	}
-	chain := middleware.Chain(handler, timed...)
-	rt.chains[route.Name] = chain
-	return chain
-}
-
-// stageNames maps pipeline positions to documented names for trace output.
-func stageNames(i, n int) string {
-	// Positions 4..9 of OrderNames correspond to body-limit..rate-limit.
-	idx := 4 + i
-	if idx < len(middleware.OrderNames) && n > 0 {
-		return middleware.OrderNames[idx]
-	}
-	return "stage"
+	return middleware.Chain(handler, timed...)
 }
 
 func timeStage(name string, next middleware.Middleware) middleware.Middleware {

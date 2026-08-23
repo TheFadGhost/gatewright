@@ -200,6 +200,17 @@ func (st *targetState) done(o Outcome, now time.Time) {
 	if st.inflight > 0 {
 		st.inflight--
 	}
+	if o.ErrClass == ErrCanceled {
+		// The client went away mid-attempt: this says nothing about the
+		// target. Ignore the outcome entirely — no passive-health window,
+		// no breaker entry, no probing-streak change, no failure counters —
+		// except returning any half-open probe budget so it cannot wedge.
+		if st.cb == circuitHalfOpen && st.halfLive > 0 {
+			st.halfLive--
+		}
+		st.mu.Unlock()
+		return
+	}
 	if o.Success {
 		st.passiveFails = st.passiveFails[:0]
 		st.breakerFails = st.breakerFails[:0]

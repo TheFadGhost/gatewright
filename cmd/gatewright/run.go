@@ -28,19 +28,15 @@ func runCmd(args []string) {
 	noColor := fs.Bool("no-color", false, "disable coloured terminal output")
 	fs.Parse(args)
 
-	logger, err := obs.New(obs.Options{
-		Format: "json",
-		Output: "stdout",
-		NoColor: obs.ColourPolicy(*noColor, isTTY(os.Stdout)),
-	})
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "fatal:", err)
-		os.Exit(1)
-	}
-
 	cfg, verr := config.Load(*cfgPath)
 	if verr != nil {
 		fmt.Fprint(os.Stderr, verr.Error())
+		os.Exit(1)
+	}
+
+	logger, err := runtime.NewLoggerFromConfig(cfg, *noColor, isTTY(os.Stdout))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "fatal:", err)
 		os.Exit(1)
 	}
 
@@ -143,8 +139,10 @@ func registerReserved(mux *http.ServeMux, cfg *config.Config, metrics *obs.Metri
 		unready := unreadyPools(sup)
 		w.Header().Set("Content-Type", "application/json")
 		if len(unready) > 0 {
+			// Opaque on purpose: pool names are internal topology and must
+			// not leak through an unauthenticated probe endpoint.
 			w.WriteHeader(http.StatusServiceUnavailable)
-			_, _ = fmt.Fprintf(w, `{"status":"unavailable","pools_without_healthy_targets":%q}`, strings.Join(unready, ","))
+			_, _ = w.Write([]byte(`{"status":"unavailable"}` + "\n"))
 			return
 		}
 		_, _ = w.Write([]byte(`{"status":"ready"}`))

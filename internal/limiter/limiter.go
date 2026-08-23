@@ -74,6 +74,19 @@ type MetricsSink interface {
 	ObserveEviction(route, name, strategy string)
 }
 
+// StoreErrorSink is an OPTIONAL extension to MetricsSink: engines check for
+// it via type assertion and call it whenever a shared-store update fails, so
+// implementations that do not care never see the method.
+type StoreErrorSink interface {
+	ObserveStoreError(route, name, strategy string)
+}
+
+// WarnLogger is the minimal logging surface an engine may use (a subset of
+// obs.Logger). Nil loggers disable engine warnings entirely.
+type WarnLogger interface {
+	Warn(msg string, kv ...any)
+}
+
 // Settings are the validated, typed knobs every strategy reads. The config
 // layer fills them; factories reject combinations invalid for the strategy.
 type Settings struct {
@@ -96,6 +109,7 @@ type Params struct {
 	Backend Backend     // nil => in-memory driver
 	MaxKeys int         // memory bound per limiter; <=0 => DefaultMaxKeys
 	Metrics MetricsSink // optional
+	Logger  WarnLogger  // optional; used for once-per-limiter store warnings
 }
 
 // DefaultMaxKeys bounds unique keys per limiter unless configured otherwise.

@@ -33,29 +33,30 @@ type Supervisor struct {
 	store     *store.DB
 	storePath string
 
-	reloadMu     sync.Mutex
+	reloadMu     sync.Mutex   // serialises reload attempts
+	genMu        sync.RWMutex // gates generation swap against request acquire
 	start        time.Time
 	version      string
 	drainTimeout time.Duration
 }
 
-// Runtime is one immutable configuration generation. In-flight requests keep
-// their generation alive until completion or the drain deadline.
+// Runtime is one immutable configuration generation. In-flight requests hold
+// a reference (refs) so the previous generation stays alive until every
+// request it admitted has completed or the drain deadline expires.
 type Runtime struct {
-	Cfg        *config.Config
-	router     *proxy.Router
-	pools      *pool.Registry
-	routeFwd   map[string]*proxy.Forwarder            // route name -> forwarder
-	entries    map[string][]middleware.RateLimitEntry // route name -> limiter entries
-	engines    map[string]limiter.Limiter             // "route/name" -> engine
-	settings   map[string]uint64                      // carry-over identity
-	chains     map[string]http.Handler                // route name -> inner chain
-	chainMu    sync.RWMutex                           // guards chains (lazy build)
-	handler    http.Handler                           // full assembled pipeline
-	cancel     context.CancelFunc
-	wg         sync.WaitGroup
-	trace      bool
-	stats      *routeStats
+	Cfg      *config.Config
+	router   *proxy.Router
+	pools    *pool.Registry
+	routeFwd map[string]*proxy.Forwarder            // route name -> forwarder
+	entries  map[string][]middleware.RateLimitEntry // route name -> limiter entries
+	engines  map[string]limiter.Limiter             // "route/name" -> engine
+	settings map[string]uint64                      // carry-over identity
+	chains   map[string]http.Handler                // route name -> inner chain (immutable after build)
+	handler  http.Handler                           // full assembled pipeline
+	cancel   context.CancelFunc
+	refs     atomic.Int64 // in-flight requests holding this generation alive
+	trace    bool
+	stats    *routeStats
 }
 
 // NewSupervisor loads the initial configuration and prepares the gateway.
@@ -75,11 +76,19 @@ func NewSupervisor(cfgPath string, logger obs.Logger, metrics *obs.Metrics, vers
 	return s, nil
 }
 
-// Handler resolves the current runtime per request. Older generations serve
-// until drained, so swapping never drops an in-flight connection.
+// Handler resolves the current runtime per request. The generation reference
+// is taken under genMu's read lock so a concurrent swap can never strand a
+// request on a retired runtime without the retirement wait seeing it.
+// Older generations serve until drained, so swapping never drops an
+// in-flight connection.
 func (s *Supervisor) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.genMu.RLock()
 		rt := s.current.Load()
+		if rt != nil {
+			rt.refs.Add(1)
+		}
+		s.genMu.RUnlock()
 		if rt == nil {
 			writeJSONStatus(w, http.StatusServiceUnavailable,
 				`{"error":{"code":"UP012","message":"gateway starting"}}`)
@@ -117,7 +126,11 @@ func (s *Supervisor) applyConfig(reason string) error {
 		s.countReload(false)
 		return err
 	}
-	old := s.current.Swap(rt)
+	old := func() *Runtime {
+		s.genMu.Lock()
+		defer s.genMu.Unlock()
+		return s.current.Swap(rt)
+	}()
 	s.countReload(true)
 	if old != nil {
 		old.shutdownAsync(s.drainTimeout, s.logger)
@@ -158,24 +171,41 @@ func (s *Supervisor) configHash() string {
 	return fmt.Sprintf("%016x", h.Sum64())
 }
 
-// serve tracks in-flight work for drain accounting.
+// serve runs one request on a generation whose reference was already taken
+// by Handler (refs includes this request until it returns).
 func (rt *Runtime) serve(w http.ResponseWriter, r *http.Request) {
-	rt.wg.Add(1)
-	defer rt.wg.Done()
+	defer rt.refs.Add(-1)
 	rt.handler.ServeHTTP(w, r)
 }
 
-// shutdownAsync stops background work and waits for in-flight requests.
+// waitDrained blocks until every in-flight reference on rt is released or the
+// grace deadline expires. Callers must have removed rt from the acquire path
+// first: either via the genMu-guarded swap in applyConfig or the swap-to-nil
+// in Drain.
+func (rt *Runtime) waitDrained(grace time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for rt.refs.Load() > 0 {
+			time.Sleep(time.Millisecond)
+		}
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(grace):
+		return false
+	}
+}
+
+// shutdownAsync stops background work and waits for in-flight requests on the
+// retired generation before closing its pools.
 func (rt *Runtime) shutdownAsync(grace time.Duration, logger obs.Logger) {
 	go func() {
 		if rt.cancel != nil {
 			rt.cancel()
 		}
-		done := make(chan struct{})
-		go func() { rt.wg.Wait(); close(done) }()
-		select {
-		case <-done:
-		case <-time.After(grace):
+		if !rt.waitDrained(grace) {
 			logger.Warn("drain deadline exceeded; closing remaining connections", "grace", grace.String())
 		}
 		for _, p := range rt.pools.All() {
@@ -184,20 +214,20 @@ func (rt *Runtime) shutdownAsync(grace time.Duration, logger obs.Logger) {
 	}()
 }
 
-// Drain performs orderly final shutdown when the process is exiting.
+// Drain performs orderly final shutdown when the process is exiting. The
+// current generation is swapped out under genMu so no new request can take a
+// reference while the drain waits for the existing ones.
 func (s *Supervisor) Drain(grace time.Duration) {
-	rt := s.current.Load()
+	s.genMu.Lock()
+	rt := s.current.Swap(nil)
+	s.genMu.Unlock()
 	if rt == nil {
 		return
 	}
 	if rt.cancel != nil {
 		rt.cancel()
 	}
-	done := make(chan struct{})
-	go func() { rt.wg.Wait(); close(done) }()
-	select {
-	case <-done:
-	case <-time.After(grace):
+	if !rt.waitDrained(grace) {
 		s.logger.Warn("shutdown drain deadline exceeded", "grace", grace.String())
 	}
 	for _, p := range rt.pools.All() {
