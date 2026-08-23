@@ -50,3 +50,4 @@ gw-err.log
 gw-smoke.log
 gw-head.txt
 state.json
+*.exe~
