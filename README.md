@@ -1,5 +1,12 @@
 # Gatewright
 
+> **built with ox alpha**
+>
+> most of this was written in august 2026 during the free preview window of
+> [ox alpha](https://openrouter.ai/stealth/ox-alpha), an anonymous stealth model
+> that turned up on openrouter for about a week. i set the direction and reviewed
+> what came back. the tests are real and they pass — clone it and run them.
+
 Gatewright is a readable reverse-proxy API gateway with pluggable rate limiting, built for backend developers who want one static binary, a YAML file they can edit under pressure, and a limiter plugin contract they can extend in Go.
 
 ## Install
